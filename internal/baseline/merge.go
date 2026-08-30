@@ -46,6 +46,12 @@ type Accumulator struct {
 	largeAlloc map[int64]bool
 	peakRSS    int64
 	heapGrowth int64
+
+	regCreated   map[string]schema.RegistryKey
+	regWritten   map[string]schema.RegistryKey
+	regDeleted   map[string]schema.RegistryKey
+	regAvailable bool
+	regPersist   bool
 }
 
 // New returns an empty Accumulator.
@@ -70,6 +76,9 @@ func New() *Accumulator {
 		memRegions:   map[string]schema.MemoryRegion{},
 		mappedMem:    map[string]bool{},
 		largeAlloc:   map[int64]bool{},
+		regCreated:   map[string]schema.RegistryKey{},
+		regWritten:   map[string]schema.RegistryKey{},
+		regDeleted:   map[string]schema.RegistryKey{},
 	}
 }
 
@@ -79,7 +88,7 @@ func (a *Accumulator) Runs() int { return a.runs }
 // AddRun folds one run's observations into the accumulator. Any argument may be
 // nil (e.g. no syscall backend, or a non-Linux stub).
 func (a *Accumulator) AddRun(s *schema.SyscallsObservation, n *schema.NetworkObservation, f *schema.FilesystemObservation,
-	p *schema.ProcessObservation, m *schema.MemoryObservation) {
+	p *schema.ProcessObservation, m *schema.MemoryObservation, r *schema.RegistryObservation) {
 	a.runs++
 
 	if s != nil {
@@ -163,6 +172,24 @@ func (a *Accumulator) AddRun(s *schema.SyscallsObservation, n *schema.NetworkObs
 			a.heapGrowth = m.HeapGrowthKB
 		}
 	}
+
+	if r != nil {
+		if r.Available {
+			a.regAvailable = true
+		}
+		if r.PersistencePathTouched {
+			a.regPersist = true
+		}
+		for _, k := range r.KeysCreated {
+			a.regCreated[k.Key] = k
+		}
+		for _, k := range r.KeysWritten {
+			a.regWritten[k.Key] = k
+		}
+		for _, k := range r.KeysDeleted {
+			a.regDeleted[k.Key] = k
+		}
+	}
 }
 
 // Result is the union of all runs' observations plus variance notes.
@@ -172,6 +199,7 @@ type Result struct {
 	Filesystem schema.FilesystemObservation
 	Process    schema.ProcessObservation
 	Memory     schema.MemoryObservation
+	Registry   schema.RegistryObservation
 	Notes      []string
 }
 
@@ -235,14 +263,39 @@ func (a *Accumulator) Build() Result {
 	}
 	sort.Slice(mem.LargeAllocations, func(i, j int) bool { return mem.LargeAllocations[i] < mem.LargeAllocations[j] })
 
+	reg := schema.RegistryObservation{
+		Available:              a.regAvailable,
+		PersistencePathTouched: a.regPersist,
+		Context:                schema.SensorUnavailable,
+	}
+	if a.regAvailable {
+		reg.Context = schema.SensorNative
+	}
+	reg.KeysCreated = regSlice(a.regCreated)
+	reg.KeysWritten = regSlice(a.regWritten)
+	reg.KeysDeleted = regSlice(a.regDeleted)
+
 	return Result{
 		Syscalls:   sys,
 		Network:    net,
 		Filesystem: fs,
 		Process:    proc,
 		Memory:     mem,
+		Registry:   reg,
 		Notes:      a.varianceNotes(),
 	}
+}
+
+func regSlice(m map[string]schema.RegistryKey) []schema.RegistryKey {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]schema.RegistryKey, 0, len(m))
+	for _, k := range m {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
 }
 
 // Confidence maps a run count to a baseline confidence level, and — matching

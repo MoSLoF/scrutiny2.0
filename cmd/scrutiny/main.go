@@ -29,6 +29,7 @@ import (
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/network"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/procfs"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/strace"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor/sysmon"
 )
 
 const banner = `
@@ -217,7 +218,7 @@ func runBaseline(cfg Config) {
 		}
 		started := time.Now().UTC()
 		c := captureAll(cfg, capReport.Backend, platformCtx)
-		acc.AddRun(c.syscalls, c.network, c.files, c.process, c.memory)
+		acc.AddRun(c.syscalls, c.network, c.files, c.process, c.memory, c.registry)
 		record.Scrutiny.Quality.Runs = append(record.Scrutiny.Quality.Runs, schema.RunRecord{
 			RunID:     run,
 			PID:       cfg.PID,
@@ -232,6 +233,7 @@ func runBaseline(cfg Config) {
 	record.Filesystem = res.Filesystem
 	record.Process = res.Process
 	record.Memory = res.Memory
+	record.Registry = res.Registry
 	record.Scrutiny.Quality.RunCount = acc.Runs()
 	record.Scrutiny.Quality.Confidence = baseline.Confidence(acc.Runs(), len(res.Notes) > 0)
 	record.Scrutiny.Quality.VarianceNotes = res.Notes
@@ -298,6 +300,9 @@ func runObserve(cfg Config) {
 	}
 	if c.memory != nil {
 		obs.Memory = *c.memory
+	}
+	if c.registry != nil {
+		obs.Registry = *c.registry
 	}
 
 	obs.ContextMatch = baseline.Scrutiny.Platform.DetectedPlatform == platformCtx.DetectedPlatform
@@ -383,6 +388,7 @@ type capture struct {
 	network  *schema.NetworkObservation
 	process  *schema.ProcessObservation
 	memory   *schema.MemoryObservation
+	registry *schema.RegistryObservation
 }
 
 // captureAll runs the kernel (syscall + filesystem), network, process, and
@@ -391,6 +397,28 @@ type capture struct {
 // procfs-based collectors poll in the background.
 func captureAll(cfg Config, backend schema.SensorBackend, platformCtx schema.PlatformContext) capture {
 	dur := time.Duration(cfg.Duration) * time.Second
+
+	// Windows: Sysmon populates process/network/filesystem/registry directly
+	// (no syscall dimension) — a different collection shape from the Linux
+	// eBPF/strace + procfs stack, so it's handled on its own.
+	if backend == schema.BackendSysmon {
+		res, err := sysmon.Collect(cfg.PID, dur)
+		if err != nil {
+			fmt.Printf("Sysmon collection failed: %v\n", err)
+			return capture{}
+		}
+		fmt.Printf("Sysmon: %d event(s) in window, %d for target subtree — %d child(ren), %d outbound, %d DNS, %d file, %d registry key(s)\n",
+			res.EventsRead, res.EventsForPID,
+			len(res.Process.ChildrenSpawned), len(res.Network.OutboundConnections),
+			len(res.Network.DNSQueries), len(res.Filesystem.PathsCreated)+len(res.Filesystem.PathsDeleted),
+			len(res.Registry.KeysWritten)+len(res.Registry.KeysCreated)+len(res.Registry.KeysDeleted))
+		return capture{
+			process:  &res.Process,
+			network:  &res.Network,
+			files:    &res.Filesystem,
+			registry: &res.Registry,
+		}
+	}
 
 	var netObs *schema.NetworkObservation
 	var procObs *schema.ProcessObservation

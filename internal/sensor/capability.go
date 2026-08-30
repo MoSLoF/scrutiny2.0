@@ -21,6 +21,7 @@ import (
 
 	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/ebpf"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor/sysmon"
 )
 
 // CapabilityReport is the full output of the capability probe.
@@ -296,11 +297,15 @@ func pickFallback(r CapabilityReport) schema.SensorBackend {
 }
 
 func windowsReport() CapabilityReport {
-	return CapabilityReport{
-		Backend:         schema.BackendETW,
-		EBPFAvailable:   false,
-		StraceAvailable: false,
+	r := CapabilityReport{EBPFAvailable: false, StraceAvailable: false}
+	if sysmon.Available() {
+		r.Backend = schema.BackendSysmon
+	} else {
+		r.Backend = schema.BackendNone
+		r.Warnings = append(r.Warnings,
+			"no Sysmon service found — install Sysmon (process/network/file/registry telemetry) or Scrutiny is blind on Windows")
 	}
+	return r
 }
 
 func kernelMeetsMin(major, minor, minMajor, minMinor int) bool {

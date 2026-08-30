@@ -157,15 +157,23 @@ func (a *Accumulator) Build() (schema.SyscallsObservation, schema.NetworkObserva
 }
 
 // Confidence maps a run count to a baseline confidence level.
-func Confidence(runs int) schema.BaselineConfidence {
+// Confidence maps a run count to a baseline confidence level, and — matching
+// ConfidenceHigh's documented "3+ *consistent* runs" — caps at Medium when the
+// runs disagreed with each other (hasVariance). A baseline whose features come
+// and go across runs isn't something to alert against with high confidence, no
+// matter how many runs were captured.
+func Confidence(runs int, hasVariance bool) schema.BaselineConfidence {
+	c := schema.ConfidenceLow
 	switch {
 	case runs >= 3:
-		return schema.ConfidenceHigh
+		c = schema.ConfidenceHigh
 	case runs == 2:
-		return schema.ConfidenceMedium
-	default:
-		return schema.ConfidenceLow
+		c = schema.ConfidenceMedium
 	}
+	if hasVariance && c == schema.ConfidenceHigh {
+		c = schema.ConfidenceMedium
+	}
+	return c
 }
 
 // ─── internals ─────────────────────────────────────────────────────────────────

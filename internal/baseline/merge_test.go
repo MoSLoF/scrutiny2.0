@@ -35,15 +35,25 @@ func TestAddRun_UnionsSyscallsAndSumsCounts(t *testing.T) {
 }
 
 func TestConfidence(t *testing.T) {
-	cases := map[int]schema.BaselineConfidence{
-		1: schema.ConfidenceLow,
-		2: schema.ConfidenceMedium,
-		3: schema.ConfidenceHigh,
-		5: schema.ConfidenceHigh,
+	cases := []struct {
+		runs     int
+		variance bool
+		want     schema.BaselineConfidence
+	}{
+		{1, false, schema.ConfidenceLow},
+		{2, false, schema.ConfidenceMedium},
+		{3, false, schema.ConfidenceHigh},
+		{5, false, schema.ConfidenceHigh},
+		// Variance caps an otherwise-high confidence at medium — a baseline
+		// whose runs disagree isn't "consistent" no matter the run count.
+		{3, true, schema.ConfidenceMedium},
+		{5, true, schema.ConfidenceMedium},
+		// Variance can't lift confidence, only cap it.
+		{1, true, schema.ConfidenceLow},
 	}
-	for runs, want := range cases {
-		if got := Confidence(runs); got != want {
-			t.Errorf("Confidence(%d) = %s, want %s", runs, got, want)
+	for _, tc := range cases {
+		if got := Confidence(tc.runs, tc.variance); got != tc.want {
+			t.Errorf("Confidence(%d, variance=%v) = %s, want %s", tc.runs, tc.variance, got, tc.want)
 		}
 	}
 }

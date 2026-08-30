@@ -227,7 +227,7 @@ func runBaseline(cfg Config) {
 	record.Network = net
 	record.Filesystem = fs
 	record.Scrutiny.Quality.RunCount = acc.Runs()
-	record.Scrutiny.Quality.Confidence = baseline.Confidence(acc.Runs())
+	record.Scrutiny.Quality.Confidence = baseline.Confidence(acc.Runs(), len(notes) > 0)
 	record.Scrutiny.Quality.VarianceNotes = notes
 
 	fmt.Printf("Baseline complete: %d run(s), confidence %s, %d distinct syscalls\n",

@@ -212,7 +212,7 @@ func runBaseline(cfg Config) {
 			fmt.Printf("── run %d/%d ──\n", run, runs)
 		}
 		started := time.Now().UTC()
-		syscalls, files, netObs := captureAll(cfg, capReport.Backend)
+		syscalls, files, netObs := captureAll(cfg, capReport.Backend, platformCtx)
 		acc.AddRun(syscalls, netObs, files)
 		record.Scrutiny.Quality.Runs = append(record.Scrutiny.Quality.Runs, schema.RunRecord{
 			RunID:     run,
@@ -277,7 +277,7 @@ func runObserve(cfg Config) {
 	obs := schema.NewObservation(baseline.Scrutiny.BaselineID, platformCtx, targetForPID(cfg.PID))
 	obs.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	syscalls, files, netObs := captureAll(cfg, capReport.Backend)
+	syscalls, files, netObs := captureAll(cfg, capReport.Backend, platformCtx)
 	if syscalls != nil {
 		obs.Syscalls = *syscalls
 	}
@@ -363,7 +363,7 @@ func targetForPID(pid int) schema.TargetProcess {
 // against the target over the same window, concurrently. Any of the returned
 // observations may be nil. Network polling runs in the background while the
 // syscall backend holds the foreground for the capture duration.
-func captureAll(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObservation, *schema.FilesystemObservation, *schema.NetworkObservation) {
+func captureAll(cfg Config, backend schema.SensorBackend, platformCtx schema.PlatformContext) (*schema.SyscallsObservation, *schema.FilesystemObservation, *schema.NetworkObservation) {
 	dur := time.Duration(cfg.Duration) * time.Second
 
 	var netObs *schema.NetworkObservation
@@ -378,7 +378,7 @@ func captureAll(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObser
 		netObs = no
 	}()
 
-	syscalls, files := captureKernel(cfg, backend)
+	syscalls, files := captureKernel(cfg, backend, platformCtx)
 	<-done
 
 	if netObs != nil {
@@ -391,10 +391,10 @@ func captureAll(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObser
 // captureKernel runs the active kernel backend against the target for the
 // configured duration, returning the syscall and filesystem observations.
 // Both are nil when no kernel backend is available (or is stubbed).
-func captureKernel(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObservation, *schema.FilesystemObservation) {
+func captureKernel(cfg Config, backend schema.SensorBackend, platformCtx schema.PlatformContext) (*schema.SyscallsObservation, *schema.FilesystemObservation) {
 	switch backend {
 	case schema.BackendEBPF:
-		so, fo, err := ebpf.Collect(uint32(cfg.PID), time.Duration(cfg.Duration)*time.Second)
+		so, fo, err := ebpf.Collect(uint32(cfg.PID), time.Duration(cfg.Duration)*time.Second, platformCtx)
 		if err != nil {
 			fatalf("eBPF collection failed: %v", err)
 		}

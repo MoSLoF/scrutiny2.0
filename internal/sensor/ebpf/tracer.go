@@ -298,8 +298,10 @@ const maxFileAccesses = 500000
 
 // Collect runs the tracer against a PID for the given duration and returns the
 // syscall and filesystem observations. This is the primary entry point called
-// from the baseline/observe CLI commands.
-func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, *schema.FilesystemObservation, error) {
+// from the baseline/observe CLI commands. platformCtx is threaded through to
+// the filesystem classifier so interop-boundary flagging (WSL vs Wine) uses
+// the right rule for the context actually being observed.
+func Collect(pid uint32, duration time.Duration, platformCtx schema.PlatformContext) (*schema.SyscallsObservation, *schema.FilesystemObservation, error) {
 	tracer, err := NewSyscallTracer()
 	if err != nil {
 		return nil, nil, err
@@ -333,12 +335,12 @@ func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, *
 		select {
 		case <-timeout:
 			finalizeSuspiciousFlags(obs)
-			return obs, buildFilesystem(accesses), nil
+			return obs, buildFilesystem(accesses, platformCtx), nil
 
 		case evt, ok := <-tracer.events:
 			if !ok {
 				finalizeSuspiciousFlags(obs)
-				return obs, buildFilesystem(accesses), nil
+				return obs, buildFilesystem(accesses, platformCtx), nil
 			}
 			recordSyscallEvent(obs, evt, &firstEventNS)
 
@@ -410,20 +412,14 @@ func formatArgs(args [6]uint64) string {
 		args[0], args[1], args[2], args[3], args[4], args[5])
 }
 
-// finalizeSuspiciousFlags cross-references observed syscalls against the
-// always-suspicious list seeded in schema.NewBaseline.
+// finalizeSuspiciousFlags stamps the baseline's always-suspicious watch list.
+// This is the set of syscalls that should never appear; analysis.diffSyscalls
+// cross-references it against a later observation. It is intentionally the
+// watch-list (what to look out for), not a hit-list of what fired this run.
 func finalizeSuspiciousFlags(obs *schema.SyscallsObservation) {
-	suspicious := []string{
+	obs.SuspiciousNeverExpected = []string{
 		"ptrace", "process_vm_readv", "process_vm_writev",
 		"init_module", "finit_module", "delete_module",
 		"kexec_load", "kexec_file_load",
 	}
-	seen := map[string]bool{}
-	for _, s := range suspicious {
-		if _, ok := obs.Observed[s]; ok {
-			seen[s] = true
-		}
-	}
-	obs.SuspiciousNeverExpected = suspicious
-	_ = seen // anomaly cross-reference happens in the analysis engine (Phase 3)
 }

@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/MoSLoF/scrutiny2.0/internal/context"
 	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 )
 
@@ -68,7 +69,12 @@ func bucketsFor(a FileAccess) []int {
 // buildFilesystem folds a stream of file accesses into a FilesystemObservation:
 // deduplicated per (bucket, path) with occurrence counts, sensitivity and
 // interop-boundary flags, and a deterministic ordering.
-func buildFilesystem(accesses []FileAccess) *schema.FilesystemObservation {
+//
+// platformCtx decides what "crosses the interop boundary" means: WSL and
+// Wine cross it at completely different paths (/mnt/c/... vs
+// ~/.wine/drive_c/...), so this must be context.IsInteropPath, not a bare
+// "/mnt/" prefix check — a fixed prefix silently never fires under Wine.
+func buildFilesystem(accesses []FileAccess, platformCtx schema.PlatformContext) *schema.FilesystemObservation {
 	type key struct {
 		bucket int
 		path   string
@@ -90,7 +96,7 @@ func buildFilesystem(accesses []FileAccess) *schema.FilesystemObservation {
 			NormalizedPath: path,
 			Count:          count,
 			Sensitive:      isSensitivePath(path),
-			InteropPath:    isInteropPath(path),
+			InteropPath:    context.IsInteropPath(path, platformCtx),
 		})
 	}
 	for k, c := range counts {
@@ -141,10 +147,4 @@ func isSensitivePath(path string) bool {
 		}
 	}
 	return false
-}
-
-// isInteropPath reports whether a path crosses the WSL interop boundary
-// (the Windows filesystem mounted under /mnt).
-func isInteropPath(path string) bool {
-	return strings.HasPrefix(path, "/mnt/")
 }

@@ -34,6 +34,6 @@ func (t *SyscallTracer) Stop() {}
 // layer never calls this in practice — sensor.Probe's Backend selection
 // steers Windows to the ETW/Sysmon collector instead — but the function
 // must exist with a matching signature for the package to compile here.
-func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, *schema.FilesystemObservation, error) {
+func Collect(pid uint32, duration time.Duration, platformCtx schema.PlatformContext) (*schema.SyscallsObservation, *schema.FilesystemObservation, error) {
 	return nil, nil, fmt.Errorf("eBPF is Linux-only; use the ETW/Sysmon backend on this platform")
 }

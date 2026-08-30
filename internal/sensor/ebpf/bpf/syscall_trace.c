@@ -107,6 +107,41 @@ struct {
 	__type(value, struct active_syscall);
 } active SEC(".maps");
 
+// ─── Filesystem events ─────────────────────────────────────────────────────────
+// File-relevant syscalls additionally emit a path-carrying event on a SEPARATE
+// ring buffer, so the hot syscall_event stays small. The path string is read
+// from the userspace argument pointer at syscall-enter time.
+
+#define PATH_LEN 256
+
+// op codes — kept in sync with the Go decoder (fsclassify.go).
+#define OP_OPEN   0
+#define OP_DELETE 1
+#define OP_EXEC   2
+#define OP_RENAME 3
+
+// x86_64 open() flag bits we care about for read/write/create classification.
+#define F_WRONLY 0x1
+#define F_RDWR   0x2
+#define F_CREAT  0x40
+#define F_TRUNC  0x200
+
+struct file_event {
+	__u64 timestamp_ns;
+	__u32 pid;
+	__u32 tid;
+	__s64 syscall_nr;
+	__u32 flags; // open flags (OP_OPEN only); 0 otherwise
+	__u8  op;
+	__u8  _pad[3];
+	char  path[PATH_LEN];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 22); // 4MB — paths are chunky, file syscalls rarer
+} file_events SEC(".maps");
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 static __always_inline int pid_is_tracked(__u32 pid) {
@@ -127,6 +162,49 @@ static __always_inline int resolve_ns_pid(__u32 *pid, __u32 *tid) {
 	*pid = nsinfo.tgid;
 	*tid = nsinfo.pid;
 	return 1;
+}
+
+// maybe_emit_file emits a path-carrying event for file-relevant syscalls. a0..a3
+// are the first four raw syscall-argument registers; the path pointer and flags
+// are selected per syscall (x86_64 numbers). Non-file syscalls are ignored.
+static __always_inline void maybe_emit_file(__s64 nr, __u32 pid, __u32 tid, __u64 ts,
+					    __u64 a0, __u64 a1, __u64 a2, __u64 a3) {
+	void *path_ptr = 0;
+	__u32 flags = 0;
+	__u8 op = OP_OPEN;
+
+	switch (nr) {
+	case 2:   path_ptr = (void *)a0; flags = (__u32)a1; op = OP_OPEN; break;   // open
+	case 257: path_ptr = (void *)a1; flags = (__u32)a2; op = OP_OPEN; break;   // openat
+	case 437: path_ptr = (void *)a1; op = OP_OPEN; break;                      // openat2 (flags in struct)
+	case 85:  path_ptr = (void *)a0; flags = F_CREAT | F_WRONLY | F_TRUNC; op = OP_OPEN; break; // creat
+	case 87:  path_ptr = (void *)a0; op = OP_DELETE; break;                    // unlink
+	case 263: path_ptr = (void *)a1; op = OP_DELETE; break;                    // unlinkat
+	case 59:  path_ptr = (void *)a0; op = OP_EXEC; break;                      // execve
+	case 322: path_ptr = (void *)a1; op = OP_EXEC; break;                      // execveat
+	case 82:  path_ptr = (void *)a1; op = OP_RENAME; break;                    // rename (newpath)
+	case 264: path_ptr = (void *)a3; op = OP_RENAME; break;                    // renameat (newpath)
+	case 316: path_ptr = (void *)a3; op = OP_RENAME; break;                    // renameat2 (newpath)
+	default:
+		return;
+	}
+	if (!path_ptr)
+		return;
+
+	struct file_event *fe = bpf_ringbuf_reserve(&file_events, sizeof(*fe), 0);
+	if (!fe)
+		return;
+
+	fe->timestamp_ns = ts;
+	fe->pid = pid;
+	fe->tid = tid;
+	fe->syscall_nr = nr;
+	fe->flags = flags;
+	fe->op = op;
+	fe->path[0] = 0;
+	bpf_probe_read_user_str(fe->path, sizeof(fe->path), path_ptr);
+
+	bpf_ringbuf_submit(fe, 0);
 }
 
 // ─── Probes ──────────────────────────────────────────────────────────────────
@@ -167,14 +245,21 @@ int trace_sys_enter(struct bpf_raw_tracepoint_args *ctx) {
 	bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
 
 	// x86_64 syscall arguments, read from pt_regs via CO-RE.
-	evt->args[0] = BPF_CORE_READ(regs, di);
-	evt->args[1] = BPF_CORE_READ(regs, si);
-	evt->args[2] = BPF_CORE_READ(regs, dx);
-	evt->args[3] = BPF_CORE_READ(regs, r10);
+	__u64 a0 = BPF_CORE_READ(regs, di);
+	__u64 a1 = BPF_CORE_READ(regs, si);
+	__u64 a2 = BPF_CORE_READ(regs, dx);
+	__u64 a3 = BPF_CORE_READ(regs, r10);
+	evt->args[0] = a0;
+	evt->args[1] = a1;
+	evt->args[2] = a2;
+	evt->args[3] = a3;
 	evt->args[4] = BPF_CORE_READ(regs, r8);
 	evt->args[5] = BPF_CORE_READ(regs, r9);
 
 	bpf_ringbuf_submit(evt, 0);
+
+	// Path-carrying event for file-relevant syscalls (separate ring buffer).
+	maybe_emit_file(nr, pid, tid, ts, a0, a1, a2, a3);
 	return 0;
 }
 

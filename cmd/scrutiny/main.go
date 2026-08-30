@@ -193,11 +193,14 @@ func runBaseline(cfg Config) {
 	baseline := schema.NewBaseline(platformCtx, targetForPID(cfg.PID))
 	baseline.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	syscalls, netObs := captureAll(cfg, capReport.Backend)
+	syscalls, files, netObs := captureAll(cfg, capReport.Backend)
 	if syscalls != nil {
 		baseline.Syscalls = *syscalls
 		baseline.Scrutiny.Quality.RunCount = 1
 		baseline.Scrutiny.Quality.Confidence = schema.ConfidenceLow
+	}
+	if files != nil {
+		baseline.Filesystem = *files
 	}
 	if netObs != nil {
 		baseline.Network = *netObs
@@ -233,9 +236,12 @@ func runObserve(cfg Config) {
 	obs := schema.NewObservation(baseline.Scrutiny.BaselineID, platformCtx, targetForPID(cfg.PID))
 	obs.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	syscalls, netObs := captureAll(cfg, capReport.Backend)
+	syscalls, files, netObs := captureAll(cfg, capReport.Backend)
 	if syscalls != nil {
 		obs.Syscalls = *syscalls
+	}
+	if files != nil {
+		obs.Filesystem = *files
 	}
 	if netObs != nil {
 		obs.Network = *netObs
@@ -312,11 +318,11 @@ func targetForPID(pid int) schema.TargetProcess {
 	return target
 }
 
-// captureAll runs the syscall and network collectors against the target over
-// the same window, concurrently, and returns both observations (either may be
-// nil). Network polling runs in the background while the syscall backend holds
-// the foreground for the capture duration.
-func captureAll(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObservation, *schema.NetworkObservation) {
+// captureAll runs the kernel (syscall + filesystem) and network collectors
+// against the target over the same window, concurrently. Any of the returned
+// observations may be nil. Network polling runs in the background while the
+// syscall backend holds the foreground for the capture duration.
+func captureAll(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObservation, *schema.FilesystemObservation, *schema.NetworkObservation) {
 	dur := time.Duration(cfg.Duration) * time.Second
 
 	var netObs *schema.NetworkObservation
@@ -331,34 +337,44 @@ func captureAll(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObser
 		netObs = no
 	}()
 
-	syscalls := captureSyscalls(cfg, backend)
+	syscalls, files := captureKernel(cfg, backend)
 	<-done
 
 	if netObs != nil {
 		fmt.Printf("Captured %d listening port(s), %d outbound connection(s)\n",
 			len(netObs.ListeningPorts), len(netObs.OutboundConnections))
 	}
-	return syscalls, netObs
+	return syscalls, files, netObs
 }
 
-// captureSyscalls runs the active backend against the target for the configured
-// duration. Returns nil when no syscall backend is available (or is stubbed),
-// leaving the caller's record with metadata only.
-func captureSyscalls(cfg Config, backend schema.SensorBackend) *schema.SyscallsObservation {
+// captureKernel runs the active kernel backend against the target for the
+// configured duration, returning the syscall and filesystem observations.
+// Both are nil when no kernel backend is available (or is stubbed).
+func captureKernel(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObservation, *schema.FilesystemObservation) {
 	switch backend {
 	case schema.BackendEBPF:
-		so, err := ebpf.Collect(uint32(cfg.PID), time.Duration(cfg.Duration)*time.Second)
+		so, fo, err := ebpf.Collect(uint32(cfg.PID), time.Duration(cfg.Duration)*time.Second)
 		if err != nil {
 			fatalf("eBPF collection failed: %v", err)
 		}
-		fmt.Printf("Captured %d distinct syscalls via eBPF\n", len(so.Observed))
-		return so
+		fmt.Printf("Captured %d distinct syscalls, %d file path(s) via eBPF\n",
+			len(so.Observed), fileCount(fo))
+		return so, fo
 	case schema.BackendStrace:
 		fmt.Println("strace backend selected — collector wiring pending (Phase 2b)")
 	default:
 		fmt.Println("No syscall backend available — capturing metadata only")
 	}
-	return nil
+	return nil, nil
+}
+
+// fileCount totals the distinct file paths across every filesystem bucket.
+func fileCount(fo *schema.FilesystemObservation) int {
+	if fo == nil {
+		return 0
+	}
+	return len(fo.PathsRead) + len(fo.PathsWritten) + len(fo.PathsCreated) +
+		len(fo.PathsDeleted) + len(fo.ExecsTouched)
 }
 
 // printAnalysis renders an AnalysisResult as a human-readable report.

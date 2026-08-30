@@ -42,17 +42,32 @@ type syscallEvent struct {
 	Comm        [16]byte
 }
 
+// fileEvent mirrors the C struct file_event byte-for-byte (path-carrying
+// events for file-relevant syscalls, delivered on a separate ring buffer).
+type fileEvent struct {
+	TimestampNS uint64
+	PID         uint32
+	TID         uint32
+	SyscallNr   int64
+	Flags       uint32
+	Op          uint8
+	_           [3]byte
+	Path        [256]byte
+}
+
 // SyscallTracer manages the lifecycle of the syscall eBPF probe:
-// load -> attach -> filter PIDs -> consume ring buffer -> detach.
+// load -> attach -> filter PIDs -> consume ring buffers -> detach.
 type SyscallTracer struct {
-	coll      *ebpf.Collection
-	enterLink link.Link
-	exitLink  link.Link
-	reader    *ringbuf.Reader
-	pidFilter *ebpf.Map
-	startTime time.Time
-	events    chan syscallEvent
-	stopCh    chan struct{}
+	coll       *ebpf.Collection
+	enterLink  link.Link
+	exitLink   link.Link
+	reader     *ringbuf.Reader
+	fileReader *ringbuf.Reader
+	pidFilter  *ebpf.Map
+	startTime  time.Time
+	events     chan syscallEvent
+	fileEvents chan fileEvent
+	stopCh     chan struct{}
 }
 
 // NewSyscallTracer loads the embedded eBPF object and attaches both
@@ -93,6 +108,11 @@ func NewSyscallTracer() (*SyscallTracer, error) {
 		coll.Close()
 		return nil, fmt.Errorf("events ring buffer map not found in object")
 	}
+	fileEventsMap, ok := coll.Maps["file_events"]
+	if !ok {
+		coll.Close()
+		return nil, fmt.Errorf("file_events ring buffer map not found in object")
+	}
 
 	// Raw tracepoint (BPF_RAW_TRACEPOINT_OPEN) rather than a perf-based
 	// tracepoint: the perf-link path is rejected with EPERM on some kernels
@@ -126,14 +146,25 @@ func NewSyscallTracer() (*SyscallTracer, error) {
 		return nil, fmt.Errorf("opening ring buffer reader: %w", err)
 	}
 
+	fileReader, err := ringbuf.NewReader(fileEventsMap)
+	if err != nil {
+		reader.Close()
+		exitLink.Close()
+		enterLink.Close()
+		coll.Close()
+		return nil, fmt.Errorf("opening file ring buffer reader: %w", err)
+	}
+
 	return &SyscallTracer{
-		coll:      coll,
-		enterLink: enterLink,
-		exitLink:  exitLink,
-		reader:    reader,
-		pidFilter: pidFilter,
-		events:    make(chan syscallEvent, 4096),
-		stopCh:    make(chan struct{}),
+		coll:       coll,
+		enterLink:  enterLink,
+		exitLink:   exitLink,
+		reader:     reader,
+		fileReader: fileReader,
+		pidFilter:  pidFilter,
+		events:     make(chan syscallEvent, 4096),
+		fileEvents: make(chan fileEvent, 4096),
+		stopCh:     make(chan struct{}),
 	}, nil
 }
 
@@ -185,6 +216,36 @@ func (t *SyscallTracer) UntrackPID(pid uint32) error {
 func (t *SyscallTracer) Start() {
 	t.startTime = time.Now()
 	go t.readLoop()
+	go t.fileReadLoop()
+}
+
+func (t *SyscallTracer) fileReadLoop() {
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		default:
+		}
+
+		record, err := t.fileReader.Read()
+		if err != nil {
+			if err == ringbuf.ErrClosed {
+				return
+			}
+			continue
+		}
+
+		var fe fileEvent
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &fe); err != nil {
+			continue
+		}
+
+		select {
+		case t.fileEvents <- fe:
+		default:
+			// consumer too slow — drop rather than block the kernel-side ring
+		}
+	}
 }
 
 func (t *SyscallTracer) readLoop() {
@@ -225,27 +286,32 @@ func (t *SyscallTracer) Events() <-chan syscallEvent {
 func (t *SyscallTracer) Stop() {
 	close(t.stopCh)
 	t.reader.Close()
+	t.fileReader.Close()
 	t.exitLink.Close()
 	t.enterLink.Close()
 	t.coll.Close()
 }
 
-// Collect runs the tracer against a PID for the given duration and
-// returns a populated schema.SyscallsObservation. This is the primary
-// entry point called from the baseline/observe CLI commands.
-func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, error) {
+// maxFileAccesses bounds the raw file-access buffer so a file-heavy target
+// can't grow it without limit before deduplication.
+const maxFileAccesses = 500000
+
+// Collect runs the tracer against a PID for the given duration and returns the
+// syscall and filesystem observations. This is the primary entry point called
+// from the baseline/observe CLI commands.
+func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, *schema.FilesystemObservation, error) {
 	tracer, err := NewSyscallTracer()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer tracer.Stop()
 
 	if err := tracer.SetTargetNS(pid); err != nil {
-		return nil, fmt.Errorf("resolving target namespace for pid %d: %w", pid, err)
+		return nil, nil, fmt.Errorf("resolving target namespace for pid %d: %w", pid, err)
 	}
 
 	if err := tracer.TrackPID(pid); err != nil {
-		return nil, fmt.Errorf("tracking pid %d: %w", pid, err)
+		return nil, nil, fmt.Errorf("tracking pid %d: %w", pid, err)
 	}
 
 	tracer.Start()
@@ -253,6 +319,7 @@ func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, e
 	obs := &schema.SyscallsObservation{
 		Observed: make(map[string]schema.SyscallRecord),
 	}
+	var accesses []FileAccess
 
 	timeout := time.After(duration)
 
@@ -266,16 +333,34 @@ func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, e
 		select {
 		case <-timeout:
 			finalizeSuspiciousFlags(obs)
-			return obs, nil
+			return obs, buildFilesystem(accesses), nil
 
 		case evt, ok := <-tracer.events:
 			if !ok {
 				finalizeSuspiciousFlags(obs)
-				return obs, nil
+				return obs, buildFilesystem(accesses), nil
 			}
 			recordSyscallEvent(obs, evt, &firstEventNS)
+
+		case fe := <-tracer.fileEvents:
+			if len(accesses) < maxFileAccesses {
+				accesses = append(accesses, FileAccess{
+					SyscallNr: fe.SyscallNr,
+					Flags:     fe.Flags,
+					Op:        fe.Op,
+					Path:      goString(fe.Path[:]),
+				})
+			}
 		}
 	}
+}
+
+// goString converts a NUL-terminated C char array to a Go string.
+func goString(b []byte) string {
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		b = b[:i]
+	}
+	return string(b)
 }
 
 const maxSamples = 3

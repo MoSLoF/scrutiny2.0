@@ -205,9 +205,40 @@ func diffFilesystem(b *schema.Baseline, o *schema.Observation, cfg schema.Anomal
 
 func diffRegistry(b *schema.Baseline, o *schema.Observation, cfg schema.AnomalyConfig) []schema.Anomaly {
 	var out []schema.Anomaly
+
+	// Host security controls loosened (T1562) — e.g. SLEEPWALKER's
+	// EveryoneIncludesAnonymous / NullSessionPipes anonymous-SMB weakening.
+	if o.Registry.SecurityWeakened && !b.Registry.SecurityWeakened {
+		out = append(out, newAnomaly(cfg, schema.DimRegistry, schema.AnomalyRegistryDefenseImpair,
+			"host security control weakened via registry (e.g. anonymous access enabled)",
+			false, true, 0))
+	}
+
+	// Autostart persistence (T1547).
 	if o.Registry.PersistencePathTouched && !b.Registry.PersistencePathTouched {
 		out = append(out, newAnomaly(cfg, schema.DimRegistry, schema.AnomalyRegistryPersistence,
 			"registry persistence path written", b.Registry.PersistencePathTouched, true, 0))
+	}
+
+	// New registry keys written/created that the baseline never touched (T1112).
+	// Keys already surfaced by the flag-based anomalies above (Sensitive) are
+	// skipped so a weakening/persistence key isn't double-reported.
+	baseKeys := map[string]bool{}
+	for _, k := range b.Registry.KeysWritten {
+		baseKeys[k.Key] = true
+	}
+	for _, k := range b.Registry.KeysCreated {
+		baseKeys[k.Key] = true
+	}
+	flagged := map[string]bool{}
+	obsKeys := append(append([]schema.RegistryKey{}, o.Registry.KeysWritten...), o.Registry.KeysCreated...)
+	for _, k := range obsKeys {
+		if k.Sensitive || baseKeys[k.Key] || flagged[k.Key] {
+			continue
+		}
+		flagged[k.Key] = true
+		out = append(out, newAnomaly(cfg, schema.DimRegistry, schema.AnomalyRegistryNewWrite,
+			fmt.Sprintf("new registry key written: %s", k.Key), nil, k.Key, 0))
 	}
 	return out
 }
@@ -262,6 +293,20 @@ func diffMemory(b *schema.Baseline, o *schema.Observation, cfg schema.AnomalyCon
 			out = append(out, newAnomaly(cfg, schema.DimMemory, schema.AnomalyExecMemoryAnonymous,
 				fmt.Sprintf("executable anonymous memory region %s", r.AddressRange), nil, r.AddressRange, 0))
 		}
+	}
+
+	// Modules mapped/loaded in the observation that the baseline never loaded —
+	// the behavioral shape of DLL side-loading (T1574), e.g. an unexpected
+	// dpapi.dll appearing in a process that never loaded one.
+	baseMods := stringSet(b.Memory.MappedFiles)
+	seen := map[string]bool{}
+	for _, m := range o.Memory.MappedFiles {
+		if baseMods[m] || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, newAnomaly(cfg, schema.DimMemory, schema.AnomalyUnexpectedModuleLoad,
+			fmt.Sprintf("module loaded not present in baseline: %s", m), nil, m, 0))
 	}
 	return out
 }

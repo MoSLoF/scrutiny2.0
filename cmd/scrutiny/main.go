@@ -417,6 +417,7 @@ func captureAll(cfg Config, backend schema.SensorBackend, platformCtx schema.Pla
 			network:  &res.Network,
 			files:    &res.Filesystem,
 			registry: &res.Registry,
+			memory:   &res.Memory,
 		}
 	}
 

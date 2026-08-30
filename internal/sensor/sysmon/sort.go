@@ -31,6 +31,8 @@ func sortResult(r *Result) {
 	sortKeys(r.Registry.KeysCreated)
 	sortKeys(r.Registry.KeysDeleted)
 	sortKeys(r.Registry.KeysWritten)
+
+	sort.Strings(r.Memory.MappedFiles)
 }
 
 func sortFiles(f []schema.FilePath) {

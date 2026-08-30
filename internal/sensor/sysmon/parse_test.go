@@ -88,6 +88,55 @@ func TestMap_RegistryPersistence(t *testing.T) {
 	}
 }
 
+// TestMap_SleepwalkerRegistryWeakening models SLEEPWALKER's two host-config
+// changes: EveryoneIncludesAnonymous=1 and a NullSessionPipes entry — the
+// author's own primary host IOCs.
+func TestMap_SleepwalkerRegistryWeakening(t *testing.T) {
+	r := MapEvents([]SysmonEvent{
+		ev(13, "ProcessId", "1000",
+			"TargetObject", `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\EveryoneIncludesAnonymous`,
+			"Details", "DWORD (0x00000001)"),
+		ev(13, "ProcessId", "1000",
+			"TargetObject", `HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters\NullSessionPipes`),
+	}, target)
+
+	if !r.Registry.SecurityWeakened {
+		t.Fatal("EveryoneIncludesAnonymous / NullSessionPipes should set SecurityWeakened")
+	}
+	if len(r.Registry.KeysWritten) != 2 {
+		t.Errorf("written keys = %d, want 2", len(r.Registry.KeysWritten))
+	}
+	for _, k := range r.Registry.KeysWritten {
+		if !k.Sensitive {
+			t.Errorf("weakening key %q should be marked sensitive", k.Key)
+		}
+	}
+}
+
+// TestMap_SleepwalkerImageLoad models the side-loaded dpapi.dll appearing as an
+// ImageLoad (EID 7) in the host process.
+func TestMap_SleepwalkerImageLoad(t *testing.T) {
+	r := MapEvents([]SysmonEvent{
+		ev(7, "ProcessId", "1000", "Image", `C:\Program Files\ESET\RemoteAdministrator\Agent\ERAAgent.exe`,
+			"ImageLoaded", `C:\Program Files\ESET\RemoteAdministrator\Agent\dpapi.dll`,
+			"Signed", "false", "SignatureStatus", "Unavailable"),
+		ev(7, "ProcessId", "1000", "ImageLoaded", `C:\Windows\System32\dpapi.dll`), // dup path differs; both kept
+	}, target)
+
+	if len(r.Memory.MappedFiles) != 2 {
+		t.Fatalf("mapped modules = %d, want 2", len(r.Memory.MappedFiles))
+	}
+	var sideloaded bool
+	for _, m := range r.Memory.MappedFiles {
+		if m == `C:\Program Files\ESET\RemoteAdministrator\Agent\dpapi.dll` {
+			sideloaded = true
+		}
+	}
+	if !sideloaded {
+		t.Error("the side-loaded dpapi.dll should appear in MappedFiles")
+	}
+}
+
 func TestMap_DNSQuery(t *testing.T) {
 	r := MapEvents([]SysmonEvent{
 		ev(22, "ProcessId", "1000", "QueryName", "evil.example.com", "QueryResults", "1.2.3.4"),

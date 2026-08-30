@@ -29,6 +29,7 @@ type Result struct {
 	Network      schema.NetworkObservation
 	Filesystem   schema.FilesystemObservation
 	Registry     schema.RegistryObservation
+	Memory       schema.MemoryObservation
 	EventsRead   int
 	EventsForPID int
 }
@@ -37,6 +38,7 @@ type Result struct {
 const (
 	eidProcessCreate      = 1
 	eidNetworkConnect     = 3
+	eidImageLoad          = 7
 	eidCreateRemoteThread = 8
 	eidProcessAccess      = 10
 	eidFileCreate         = 11
@@ -73,6 +75,7 @@ func MapEvents(events []SysmonEvent, targetPID int) Result {
 	fileDeleted := map[string]bool{}
 	regKeys := map[string]bool{}
 	dnsSeen := map[string]bool{}
+	moduleSeen := map[string]bool{}
 
 	for _, e := range events {
 		pid, _ := atoi(e.Data["ProcessId"])
@@ -135,15 +138,14 @@ func MapEvents(events []SysmonEvent, targetPID int) Result {
 				key := e.Data["TargetObject"]
 				if key != "" && !regKeys[key] {
 					regKeys[key] = true
-					rk := schema.RegistryKey{Key: key, Count: 1, Sensitive: isPersistenceKey(key)}
+					sensitive := isPersistenceKey(key) || isSecurityWeakeningKey(key)
+					rk := schema.RegistryKey{Key: key, Count: 1, Sensitive: sensitive}
 					if strings.Contains(e.Data["EventType"], "Delete") {
 						res.Registry.KeysDeleted = append(res.Registry.KeysDeleted, rk)
 					} else {
 						res.Registry.KeysCreated = append(res.Registry.KeysCreated, rk)
 					}
-					if isPersistenceKey(key) {
-						res.Registry.PersistencePathTouched = true
-					}
+					flagRegistrySignals(&res.Registry, key)
 				}
 			}
 
@@ -152,10 +154,16 @@ func MapEvents(events []SysmonEvent, targetPID int) Result {
 				key := e.Data["TargetObject"]
 				if key != "" {
 					res.Registry.KeysWritten = append(res.Registry.KeysWritten,
-						schema.RegistryKey{Key: key, Count: 1, Sensitive: isPersistenceKey(key)})
-					if isPersistenceKey(key) {
-						res.Registry.PersistencePathTouched = true
-					}
+						schema.RegistryKey{Key: key, Count: 1, Sensitive: isPersistenceKey(key) || isSecurityWeakeningKey(key)})
+					flagRegistrySignals(&res.Registry, key)
+				}
+			}
+
+		case eidImageLoad:
+			if tracked[pid] {
+				if img := e.Data["ImageLoaded"]; img != "" && !moduleSeen[img] {
+					moduleSeen[img] = true
+					res.Memory.MappedFiles = append(res.Memory.MappedFiles, img)
 				}
 			}
 
@@ -244,4 +252,40 @@ func isPersistenceKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// securityWeakeningSubstrings are registry locations that loosen host security
+// controls rather than establish persistence — chiefly the anonymous-SMB
+// weakening SLEEPWALKER performs, plus related "impair defenses" toggles.
+var securityWeakeningSubstrings = []string{
+	`\Lsa\EveryoneIncludesAnonymous`,
+	`\Lsa\RestrictAnonymous`,
+	`\Lsa\RestrictAnonymousSAM`,
+	`\LanmanServer\Parameters\NullSessionPipes`,
+	`\LanmanServer\Parameters\NullSessionShares`,
+	`\LanmanServer\Parameters\RestrictNullSessAccess`,
+	`\Windows Defender\`, // disabling AV
+	`\FirewallPolicy\`,   // disabling firewall
+	`\Terminal Server\fDenyTSConnections`,
+}
+
+func isSecurityWeakeningKey(key string) bool {
+	lower := strings.ToLower(key)
+	for _, s := range securityWeakeningSubstrings {
+		if strings.Contains(lower, strings.ToLower(s)) {
+			return true
+		}
+	}
+	return false
+}
+
+// flagRegistrySignals raises the observation-level persistence / security-
+// weakening flags for a touched key.
+func flagRegistrySignals(r *schema.RegistryObservation, key string) {
+	if isPersistenceKey(key) {
+		r.PersistencePathTouched = true
+	}
+	if isSecurityWeakeningKey(key) {
+		r.SecurityWeakened = true
+	}
 }

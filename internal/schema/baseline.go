@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	// SchemaVersion 2.1.0 added exit-side syscall data (ExitCount, ErrorCount,
-	// RetSample, latency) to SyscallRecord.
-	SchemaVersion = "2.1.0"
+	// SchemaVersion 2.2.0 added RegistryObservation.SecurityWeakened and the
+	// registry defense-impairment / new-write / module-load anomaly types.
+	// (2.1.0 added exit-side syscall data to SyscallRecord.)
+	SchemaVersion = "2.2.0"
 	ToolVersion   = "2.0.0"
 )
 
@@ -259,6 +260,10 @@ type RegistryObservation struct {
 	KeysCreated            []RegistryKey      `json:"keys_created"`
 	KeysDeleted            []RegistryKey      `json:"keys_deleted"`
 	PersistencePathTouched bool               `json:"persistence_paths_touched"`
+	// SecurityWeakened is set when a key that loosens host security controls was
+	// written — e.g. Lsa\EveryoneIncludesAnonymous or LanmanServer's
+	// NullSessionPipes (the SLEEPWALKER anonymous-SMB weakening). Schema 2.2.0.
+	SecurityWeakened bool `json:"security_weakened"`
 }
 
 // ─── Process Behavior ────────────────────────────────────────────────────────
@@ -325,6 +330,9 @@ const (
 	AnomalyChildExecMismatch       AnomalyType = "child_process_hash_mismatch"
 	AnomalyRawSocketOpened         AnomalyType = "raw_socket_opened"
 	AnomalyPromiscuousModeObserved AnomalyType = "promiscuous_mode_observed"
+	AnomalyRegistryDefenseImpair   AnomalyType = "registry_defense_impairment"
+	AnomalyRegistryNewWrite        AnomalyType = "registry_new_write"
+	AnomalyUnexpectedModuleLoad    AnomalyType = "unexpected_module_load"
 )
 
 // DefaultAnomalyWeights are the out-of-the-box risk weights (0-10).
@@ -345,6 +353,9 @@ var DefaultAnomalyWeights = map[AnomalyType]int{
 	AnomalyChildExecMismatch:       8,
 	AnomalyRawSocketOpened:         9,
 	AnomalyPromiscuousModeObserved: 8,
+	AnomalyRegistryDefenseImpair:   9,
+	AnomalyRegistryNewWrite:        5,
+	AnomalyUnexpectedModuleLoad:    7,
 }
 
 // DefaultMITREMappings maps anomaly types to ATT&CK technique IDs.
@@ -364,6 +375,9 @@ var DefaultMITREMappings = map[AnomalyType]string{
 	AnomalyChildExecMismatch:       "T1036",
 	AnomalyRawSocketOpened:         "T1040",
 	AnomalyPromiscuousModeObserved: "T1040",
+	AnomalyRegistryDefenseImpair:   "T1562", // Impair Defenses (anonymous SMB weakening)
+	AnomalyRegistryNewWrite:        "T1112", // Modify Registry
+	AnomalyUnexpectedModuleLoad:    "T1574", // Hijack Execution Flow (DLL side-loading)
 }
 
 type NoiseSuppress struct {

@@ -238,6 +238,84 @@ func TestExecutableWritten_DropperFlaggedOnce(t *testing.T) {
 	}
 }
 
+func TestSleepwalker_RegistryDefenseImpairmentFlagged(t *testing.T) {
+	// Baseline: a clean ERAAgent with no registry weakening.
+	b := baseWith()
+	b.Scrutiny.Platform.DetectedPlatform = schema.ContextNativeWindows
+	// Observation: the two SLEEPWALKER weakening keys were written.
+	o := schema.NewObservation(b.Scrutiny.BaselineID, b.Scrutiny.Platform, schema.TargetProcess{Name: "ERAAgent.exe"})
+	o.Registry = schema.RegistryObservation{
+		Available:        true,
+		SecurityWeakened: true,
+		KeysWritten: []schema.RegistryKey{
+			{Key: `HKLM\...\Lsa\EveryoneIncludesAnonymous`, Sensitive: true},
+			{Key: `HKLM\...\LanmanServer\Parameters\NullSessionPipes`, Sensitive: true},
+		},
+	}
+	r := Analyze(b, o)
+
+	var impair int
+	for _, a := range r.Anomalies {
+		if a.Type == schema.AnomalyRegistryDefenseImpair {
+			impair++
+			if a.MITRETechnique != "T1562" {
+				t.Errorf("defense-impair MITRE = %s, want T1562", a.MITRETechnique)
+			}
+		}
+		if a.Type == schema.AnomalyRegistryNewWrite {
+			t.Error("sensitive weakening keys should not also fire a generic new-write anomaly")
+		}
+	}
+	if impair != 1 {
+		t.Errorf("defense-impairment anomalies = %d, want 1", impair)
+	}
+	if r.Verdict == schema.VerdictClean {
+		t.Error("SLEEPWALKER registry weakening should not read as clean")
+	}
+}
+
+func TestRegistry_NewWriteFlaggedOncePerKey(t *testing.T) {
+	b := baseWith()
+	o := obsWith(b)
+	o.Registry.KeysWritten = []schema.RegistryKey{
+		{Key: `HKCU\Software\App\New`}, {Key: `HKCU\Software\App\New`}, // same key twice
+	}
+	r := Analyze(b, o)
+	var n int
+	for _, a := range r.Anomalies {
+		if a.Type == schema.AnomalyRegistryNewWrite {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("new_write anomalies = %d, want 1 (deduped by key)", n)
+	}
+}
+
+func TestSleepwalker_SideLoadedModuleFlagged(t *testing.T) {
+	b := baseWith()
+	b.Memory.MappedFiles = []string{`C:\Windows\System32\kernel32.dll`}
+	o := obsWith(b)
+	o.Memory.MappedFiles = []string{
+		`C:\Windows\System32\kernel32.dll`,          // in baseline
+		`C:\Program Files\ESET\...\Agent\dpapi.dll`, // NEW — side-loaded
+	}
+	r := Analyze(b, o)
+
+	var module int
+	for _, a := range r.Anomalies {
+		if a.Type == schema.AnomalyUnexpectedModuleLoad {
+			module++
+			if a.MITRETechnique != "T1574" {
+				t.Errorf("module-load MITRE = %s, want T1574", a.MITRETechnique)
+			}
+		}
+	}
+	if module != 1 {
+		t.Errorf("unexpected-module-load anomalies = %d, want 1 (only the new dpapi.dll)", module)
+	}
+}
+
 func TestRiskScore_IsCapped(t *testing.T) {
 	b := baseWith()
 	var names []string

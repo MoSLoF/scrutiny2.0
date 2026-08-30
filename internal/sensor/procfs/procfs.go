@@ -46,28 +46,57 @@ func parseMaps(data string) ([]schema.MemoryRegion, []string, []int64) {
 		if len(fields) >= 6 {
 			pathname = strings.Join(fields[5:], " ")
 		}
-		fileBacked := strings.HasPrefix(pathname, "/")
+		anon := anonymousMapping(pathname)
 
-		if fileBacked {
+		if !anon && strings.HasPrefix(pathname, "/") {
 			if !seenFile[pathname] {
 				seenFile[pathname] = true
 				mapped = append(mapped, pathname)
 			}
 		}
-		if exec && !fileBacked {
+		// Record executable regions that are effectively anonymous, or that are
+		// writable+executable (rwx) regardless of backing — legitimate code is
+		// r-x from a real file, so rwx is the injection signature either way.
+		if exec && (anon || write) {
+			backedBy := "file"
+			if anon {
+				backedBy = "anonymous"
+			}
 			regions = append(regions, schema.MemoryRegion{
 				AddressRange: addrRange,
-				BackedBy:     "anonymous",
-				Suspicious:   write, // rwx: writable AND executable AND anonymous
+				BackedBy:     backedBy,
+				Suspicious:   write, // rwx
 			})
 		}
-		if !fileBacked && write {
+		if anon && write {
 			if sz := regionSize(addrRange); sz >= largeAllocBytes {
 				large = append(large, sz)
 			}
 		}
 	}
 	return regions, mapped, large
+}
+
+// anonymousMapping reports whether a maps pathname denotes memory with no real
+// file behind it. Besides the obvious empty/bracketed cases ([heap], [stack],
+// [vdso], [anon:...]), this treats deleted-file mappings and the pseudo-devices
+// used for anonymous/executable memory as anonymous: a `(deleted)` suffix,
+// /dev/zero (how MAP_ANONYMOUS|MAP_SHARED is often reported), /dev/shm, and
+// memfd: — the exact backings in-memory injection (memfd_create, deleted-file
+// exec, shared-memory shellcode) hides behind.
+func anonymousMapping(pathname string) bool {
+	if pathname == "" || strings.HasPrefix(pathname, "[") {
+		return true
+	}
+	if strings.HasSuffix(pathname, "(deleted)") {
+		return true
+	}
+	for _, p := range []string{"/dev/zero", "/dev/shm/", "/memfd:", "memfd:", "anon_inode:"} {
+		if strings.HasPrefix(pathname, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // regionSize returns the byte size of a "start-end" hex address range.

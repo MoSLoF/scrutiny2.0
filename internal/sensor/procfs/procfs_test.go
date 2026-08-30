@@ -1,6 +1,9 @@
 package procfs
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // A representative /proc/<pid>/maps snapshot: normal r-x file-backed code, an
 // injected rwx anonymous region (the signal), a benign rw- anonymous heap, and
@@ -55,6 +58,40 @@ func TestParseMaps_NoFalsePositiveOnNormalProcess(t *testing.T) {
 	}
 	if len(large) != 0 {
 		t.Errorf("large allocations = %d, want 0", len(large))
+	}
+}
+
+// Real injection rarely shows a blank pathname: MAP_ANONYMOUS|MAP_SHARED is
+// reported as /dev/zero, and memfd/deleted-file exec mappings carry a pseudo
+// path that still starts with "/". These must classify as anonymous.
+func TestParseMaps_PseudoPathExecIsAnonymous(t *testing.T) {
+	const maps = `796813158000-796813159000 rwxs 00000000 00:01 6167 /dev/zero (deleted)
+7f0000000000-7f0000001000 r-xp 00000000 08:01 999 /memfd:jit (deleted)
+55a4c0000000-55a4c0021000 r-xp 00000000 08:01 131079 /usr/bin/target
+`
+	regions, mapped, _ := parseMaps(maps)
+
+	// The rwx /dev/zero region must be recorded, anonymous, and suspicious.
+	var foundRWX bool
+	for _, r := range regions {
+		if r.AddressRange == "796813158000-796813159000" {
+			foundRWX = true
+			if r.BackedBy != "anonymous" || !r.Suspicious {
+				t.Errorf("/dev/zero rwx region = %+v, want anonymous + suspicious", r)
+			}
+		}
+	}
+	if !foundRWX {
+		t.Error("rwx /dev/zero (deleted) region was not captured (the injection blind spot)")
+	}
+	// Pseudo paths must not leak into MappedFiles; only the real binary should.
+	for _, f := range mapped {
+		if strings.Contains(f, "/dev/zero") || strings.Contains(f, "memfd") {
+			t.Errorf("pseudo path %q should not be a mapped file", f)
+		}
+	}
+	if len(mapped) != 1 || mapped[0] != "/usr/bin/target" {
+		t.Errorf("mapped files = %v, want [/usr/bin/target]", mapped)
 	}
 }
 

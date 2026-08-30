@@ -28,6 +28,7 @@ import (
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/ebpf"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/network"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/procfs"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor/strace"
 )
 
 const banner = `
@@ -52,6 +53,7 @@ type Config struct {
 	ObsIn       string
 	Verbose     bool
 	JSONOutput  bool
+	Backend     string // force a sensor backend (e.g. "strace"), overriding the probe
 }
 
 func main() {
@@ -193,7 +195,7 @@ func runBaseline(cfg Config) {
 		runs = 1
 	}
 
-	platformCtx, capReport := detectAndProbe()
+	platformCtx, capReport := detectAndProbe(cfg.Backend)
 	fmt.Printf("Baselining PID %d — backend: %s, %d run(s) × %ds\n",
 		cfg.PID, capReport.Backend, runs, cfg.Duration)
 
@@ -274,7 +276,7 @@ func runObserve(cfg Config) {
 		fatalf("reading baseline %s: %v", cfg.BaselineIn, err)
 	}
 
-	platformCtx, capReport := detectAndProbe()
+	platformCtx, capReport := detectAndProbe(cfg.Backend)
 	fmt.Printf("Observing PID %d against baseline %s — backend: %s, duration: %ds\n",
 		cfg.PID, baseline.Scrutiny.BaselineID, capReport.Backend, cfg.Duration)
 
@@ -347,12 +349,16 @@ func runAnalyze(cfg Config) {
 
 // detectAndProbe runs context detection + capability probing and stamps the
 // probe results back into the platform context.
-func detectAndProbe() (schema.PlatformContext, sensor.CapabilityReport) {
+func detectAndProbe(backendOverride string) (schema.PlatformContext, sensor.CapabilityReport) {
 	platformCtx, err := context.Detect()
 	if err != nil {
 		fatalf("context detection failed: %v", err)
 	}
 	capReport := sensor.Probe(platformCtx)
+	if backendOverride != "" {
+		fmt.Printf("Backend overridden: %s → %s\n", capReport.Backend, backendOverride)
+		capReport.Backend = schema.SensorBackend(backendOverride)
+	}
 	sensor.ApplyToContext(&platformCtx, capReport)
 	return platformCtx, capReport
 }
@@ -455,7 +461,12 @@ func captureKernel(cfg Config, backend schema.SensorBackend, platformCtx schema.
 			len(so.Observed), fileCount(fo))
 		return so, fo
 	case schema.BackendStrace:
-		fmt.Println("strace backend selected — collector wiring pending (Phase 2b)")
+		so, fo, err := strace.Collect(uint32(cfg.PID), time.Duration(cfg.Duration)*time.Second, platformCtx)
+		if err != nil {
+			fatalf("strace collection failed: %v", err)
+		}
+		fmt.Printf("Captured %d distinct syscalls via strace\n", len(so.Observed))
+		return so, fo
 	default:
 		fmt.Println("No syscall backend available — capturing metadata only")
 	}
@@ -551,6 +562,11 @@ func parseArgs(args []string) Config {
 		case "--observation":
 			if i+1 < len(args) {
 				cfg.ObsIn = args[i+1]
+				i++
+			}
+		case "--backend":
+			if i+1 < len(args) {
+				cfg.Backend = args[i+1]
 				i++
 			}
 		case "--verbose", "-v":

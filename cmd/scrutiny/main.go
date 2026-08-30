@@ -19,6 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/MoSLoF/scrutiny2.0/internal/analysis"
 	"github.com/MoSLoF/scrutiny2.0/internal/context"
 	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor"
@@ -177,48 +178,24 @@ func printSensorCapabilityMatrix(ctx schema.PlatformContext) {
 	w.Flush()
 }
 
-// ─── Subcommand stubs ────────────────────────────────────────────────────────
+// ─── baseline ────────────────────────────────────────────────────────────────
 
 func runBaseline(cfg Config) {
 	if cfg.PID == 0 {
 		fatalf("baseline requires --pid <n>")
 	}
 
-	platformCtx, err := context.Detect()
-	if err != nil {
-		fatalf("context detection failed: %v", err)
-	}
-	capReport := sensor.Probe(platformCtx)
-	sensor.ApplyToContext(&platformCtx, capReport)
-
+	platformCtx, capReport := detectAndProbe()
 	fmt.Printf("Baselining PID %d — backend: %s, duration: %ds, runs: %d\n",
 		cfg.PID, capReport.Backend, cfg.Duration, cfg.Runs)
 
-	target := schema.TargetProcess{UID: os.Getuid()}
-	if comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", cfg.PID)); err == nil {
-		target.Name = strings.TrimSpace(string(comm))
-	}
-	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", cfg.PID)); err == nil {
-		target.Path = exe
-	}
-
-	baseline := schema.NewBaseline(platformCtx, target)
+	baseline := schema.NewBaseline(platformCtx, targetForPID(cfg.PID))
 	baseline.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	switch capReport.Backend {
-	case schema.BackendEBPF:
-		obs, err := ebpf.Collect(uint32(cfg.PID), time.Duration(cfg.Duration)*time.Second)
-		if err != nil {
-			fatalf("eBPF collection failed: %v", err)
-		}
-		baseline.Syscalls = *obs
+	if syscalls := captureSyscalls(cfg, capReport.Backend); syscalls != nil {
+		baseline.Syscalls = *syscalls
 		baseline.Scrutiny.Quality.RunCount = 1
 		baseline.Scrutiny.Quality.Confidence = schema.ConfidenceLow
-		fmt.Printf("Captured %d distinct syscalls via eBPF\n", len(obs.Observed))
-	case schema.BackendStrace:
-		fmt.Println("strace backend selected — collector wiring pending (Phase 2b)")
-	default:
-		fmt.Println("No syscall backend available — baseline will cover network/filesystem only (Phase 2b)")
 	}
 
 	if cfg.BaselineOut != "" {
@@ -229,12 +206,155 @@ func runBaseline(cfg Config) {
 	}
 }
 
+// ─── observe ─────────────────────────────────────────────────────────────────
+
 func runObserve(cfg Config) {
-	fmt.Print("Observe mode — full wiring lands with the analysis engine (Phase 3)\n")
+	if cfg.PID == 0 {
+		fatalf("observe requires --pid <n>")
+	}
+	if cfg.BaselineIn == "" {
+		fatalf("observe requires --baseline <file> to link the observation to")
+	}
+
+	var baseline schema.Baseline
+	if err := readJSONFile(cfg.BaselineIn, &baseline); err != nil {
+		fatalf("reading baseline %s: %v", cfg.BaselineIn, err)
+	}
+
+	platformCtx, capReport := detectAndProbe()
+	fmt.Printf("Observing PID %d against baseline %s — backend: %s, duration: %ds\n",
+		cfg.PID, baseline.Scrutiny.BaselineID, capReport.Backend, cfg.Duration)
+
+	obs := schema.NewObservation(baseline.Scrutiny.BaselineID, platformCtx, targetForPID(cfg.PID))
+	obs.Scrutiny.Quality.DurationSeconds = cfg.Duration
+
+	if syscalls := captureSyscalls(cfg, capReport.Backend); syscalls != nil {
+		obs.Syscalls = *syscalls
+	}
+
+	obs.ContextMatch = baseline.Scrutiny.Platform.DetectedPlatform == platformCtx.DetectedPlatform
+	if !obs.ContextMatch {
+		fmt.Printf("⚠  context mismatch — baseline: %s, observed: %s (analysis confidence will be reduced)\n",
+			baseline.Scrutiny.Platform.DetectedPlatform, platformCtx.DetectedPlatform)
+	}
+
+	if cfg.BaselineOut != "" {
+		writeJSONFile(cfg.BaselineOut, obs)
+		fmt.Printf("Observation written to %s\n", cfg.BaselineOut)
+	} else if cfg.JSONOutput {
+		printJSON(obs)
+	}
 }
 
+// ─── analyze ─────────────────────────────────────────────────────────────────
+
 func runAnalyze(cfg Config) {
-	fmt.Print("Analyze mode — analysis engine in Phase 3\n")
+	if cfg.BaselineIn == "" || cfg.ObsIn == "" {
+		fatalf("analyze requires --baseline <file> and --observation <file>")
+	}
+
+	var baseline schema.Baseline
+	if err := readJSONFile(cfg.BaselineIn, &baseline); err != nil {
+		fatalf("reading baseline %s: %v", cfg.BaselineIn, err)
+	}
+	var obs schema.Observation
+	if err := readJSONFile(cfg.ObsIn, &obs); err != nil {
+		fatalf("reading observation %s: %v", cfg.ObsIn, err)
+	}
+
+	result := analysis.Analyze(&baseline, &obs)
+
+	if cfg.BaselineOut != "" {
+		writeJSONFile(cfg.BaselineOut, result)
+	}
+	if cfg.JSONOutput {
+		printJSON(result)
+		return
+	}
+	printAnalysis(result)
+	if cfg.BaselineOut != "" {
+		fmt.Printf("\nAnalysis written to %s\n", cfg.BaselineOut)
+	}
+}
+
+// ─── Shared capture helpers ────────────────────────────────────────────────────
+
+// detectAndProbe runs context detection + capability probing and stamps the
+// probe results back into the platform context.
+func detectAndProbe() (schema.PlatformContext, sensor.CapabilityReport) {
+	platformCtx, err := context.Detect()
+	if err != nil {
+		fatalf("context detection failed: %v", err)
+	}
+	capReport := sensor.Probe(platformCtx)
+	sensor.ApplyToContext(&platformCtx, capReport)
+	return platformCtx, capReport
+}
+
+// targetForPID reads what it can about the target process from /proc.
+func targetForPID(pid int) schema.TargetProcess {
+	target := schema.TargetProcess{UID: os.Getuid()}
+	if comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil {
+		target.Name = strings.TrimSpace(string(comm))
+	}
+	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
+		target.Path = exe
+	}
+	return target
+}
+
+// captureSyscalls runs the active backend against the target for the configured
+// duration. Returns nil when no syscall backend is available (or is stubbed),
+// leaving the caller's record with metadata only.
+func captureSyscalls(cfg Config, backend schema.SensorBackend) *schema.SyscallsObservation {
+	switch backend {
+	case schema.BackendEBPF:
+		so, err := ebpf.Collect(uint32(cfg.PID), time.Duration(cfg.Duration)*time.Second)
+		if err != nil {
+			fatalf("eBPF collection failed: %v", err)
+		}
+		fmt.Printf("Captured %d distinct syscalls via eBPF\n", len(so.Observed))
+		return so
+	case schema.BackendStrace:
+		fmt.Println("strace backend selected — collector wiring pending (Phase 2b)")
+	default:
+		fmt.Println("No syscall backend available — capturing metadata only")
+	}
+	return nil
+}
+
+// printAnalysis renders an AnalysisResult as a human-readable report.
+func printAnalysis(r *schema.AnalysisResult) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ANALYSIS RESULT")
+	fmt.Fprintln(w, "───────────────")
+	fmt.Fprintf(w, "  Verdict:\t%s\n", strings.ToUpper(string(r.Verdict)))
+	fmt.Fprintf(w, "  Risk Score:\t%d / 100\n", r.RiskScore)
+	fmt.Fprintf(w, "  Confidence:\t%s\n", r.Confidence)
+	fmt.Fprintf(w, "  Context Match:\t%s\n", boolSymbol(r.ContextMatch))
+	fmt.Fprintf(w, "  Anomalies:\t%d  (critical %d, high %d, medium %d, low %d, info %d)\n",
+		r.Summary.TotalAnomalies,
+		r.Summary.BySeverity.Critical, r.Summary.BySeverity.High,
+		r.Summary.BySeverity.Medium, r.Summary.BySeverity.Low, r.Summary.BySeverity.Info)
+	w.Flush()
+
+	if len(r.Anomalies) == 0 {
+		fmt.Println("\n  No deviations from baseline.")
+		return
+	}
+
+	fmt.Println()
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  SEVERITY\tDIMENSION\tMITRE\tDESCRIPTION")
+	fmt.Fprintln(tw, "  ────────\t─────────\t─────\t───────────")
+	for _, a := range r.Anomalies {
+		sev := strings.ToUpper(string(a.Severity))
+		if a.Suppressed {
+			sev = "suppressed"
+		}
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", sev, a.Dimension, a.MITRETechnique, a.Description)
+	}
+	tw.Flush()
 }
 
 // ─── CLI Parsing ─────────────────────────────────────────────────────────────
@@ -341,6 +461,15 @@ func printJSON(v interface{}) {
 	if err := enc.Encode(v); err != nil {
 		fatalf("JSON encode error: %v", err)
 	}
+}
+
+func readJSONFile(path string, v interface{}) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return json.NewDecoder(f).Decode(v)
 }
 
 func writeJSONFile(path string, v interface{}) {

@@ -128,6 +128,33 @@ func TestPrivilegeEscalation_Process(t *testing.T) {
 	}
 }
 
+func TestExecutableWritten_DropperFlaggedOnce(t *testing.T) {
+	b := baseWith("read")
+	o := obsWith(b, "read")
+	// A dropped executable appears in both written and created (and is exec'd).
+	payload := schema.FilePath{Path: "/tmp/payload", NormalizedPath: "/tmp/payload"}
+	o.Filesystem.PathsWritten = []schema.FilePath{payload}
+	o.Filesystem.PathsCreated = []schema.FilePath{payload}
+	o.Filesystem.ExecsTouched = []schema.FilePath{payload}
+	r := Analyze(b, o)
+
+	var execWritten int
+	for _, a := range r.Anomalies {
+		if a.Type == schema.AnomalyExecutableWritten {
+			execWritten++
+		}
+	}
+	if execWritten != 1 {
+		t.Errorf("executable_written anomalies = %d, want exactly 1 (deduped)", execWritten)
+	}
+	if r.Verdict != schema.VerdictMalicious {
+		t.Errorf("verdict = %s, want malicious (dropped executable is critical)", r.Verdict)
+	}
+	if r.Summary.ByDimension[schema.DimFilesystem] != 1 {
+		t.Errorf("filesystem anomalies = %d, want 1", r.Summary.ByDimension[schema.DimFilesystem])
+	}
+}
+
 func TestRiskScore_IsCapped(t *testing.T) {
 	b := baseWith()
 	var names []string

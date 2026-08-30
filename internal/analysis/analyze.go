@@ -130,14 +130,17 @@ func diffFilesystem(b *schema.Baseline, o *schema.Observation, cfg schema.Anomal
 	var out []schema.Anomaly
 
 	// Executables newly written or created that the baseline never touched.
+	// A path can appear in both PathsWritten and PathsCreated — flag it once.
 	baseExec := map[string]bool{}
 	for _, f := range b.Filesystem.ExecsTouched {
 		baseExec[f.NormalizedPath] = true
 	}
+	flagged := map[string]bool{}
 	for _, f := range append(append([]schema.FilePath{}, o.Filesystem.PathsWritten...), o.Filesystem.PathsCreated...) {
-		if !isExecutable(o, f) || baseExec[f.NormalizedPath] {
+		if !isExecutable(o, f) || baseExec[f.NormalizedPath] || flagged[f.NormalizedPath] {
 			continue
 		}
+		flagged[f.NormalizedPath] = true
 		out = append(out, newAnomaly(cfg, schema.DimFilesystem, schema.AnomalyExecutableWritten,
 			fmt.Sprintf("executable written to %s", f.Path), nil, f.Path, 0))
 	}

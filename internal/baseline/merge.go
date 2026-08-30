@@ -37,6 +37,15 @@ type Accumulator struct {
 	filesCreated map[string]schema.FilePath
 	filesDeleted map[string]schema.FilePath
 	filesExec    map[string]schema.FilePath
+
+	children   map[string]schema.ChildProcess
+	privChng   []schema.PrivilegeChange
+	privSeen   map[string]bool
+	memRegions map[string]schema.MemoryRegion
+	mappedMem  map[string]bool
+	largeAlloc map[int64]bool
+	peakRSS    int64
+	heapGrowth int64
 }
 
 // New returns an empty Accumulator.
@@ -56,6 +65,11 @@ func New() *Accumulator {
 		filesCreated: map[string]schema.FilePath{},
 		filesDeleted: map[string]schema.FilePath{},
 		filesExec:    map[string]schema.FilePath{},
+		children:     map[string]schema.ChildProcess{},
+		privSeen:     map[string]bool{},
+		memRegions:   map[string]schema.MemoryRegion{},
+		mappedMem:    map[string]bool{},
+		largeAlloc:   map[int64]bool{},
 	}
 }
 
@@ -63,8 +77,9 @@ func New() *Accumulator {
 func (a *Accumulator) Runs() int { return a.runs }
 
 // AddRun folds one run's observations into the accumulator. Any argument may be
-// nil (e.g. no syscall backend, or a non-Linux network stub).
-func (a *Accumulator) AddRun(s *schema.SyscallsObservation, n *schema.NetworkObservation, f *schema.FilesystemObservation) {
+// nil (e.g. no syscall backend, or a non-Linux stub).
+func (a *Accumulator) AddRun(s *schema.SyscallsObservation, n *schema.NetworkObservation, f *schema.FilesystemObservation,
+	p *schema.ProcessObservation, m *schema.MemoryObservation) {
 	a.runs++
 
 	if s != nil {
@@ -115,10 +130,53 @@ func (a *Accumulator) AddRun(s *schema.SyscallsObservation, n *schema.NetworkObs
 		mergeFiles(a.filesDeleted, f.PathsDeleted)
 		mergeFiles(a.filesExec, f.ExecsTouched)
 	}
+
+	if p != nil {
+		for _, c := range p.ChildrenSpawned {
+			if _, ok := a.children[c.Path]; !ok {
+				a.children[c.Path] = c
+			}
+		}
+		for _, pc := range p.PrivilegeChanges {
+			k := fmt.Sprintf("%d|%d|%s", pc.FromUID, pc.ToUID, pc.Syscall)
+			if !a.privSeen[k] {
+				a.privSeen[k] = true
+				a.privChng = append(a.privChng, pc)
+			}
+		}
+	}
+
+	if m != nil {
+		for _, r := range m.ExecutableRegions {
+			a.memRegions[r.AddressRange] = r
+		}
+		for _, mf := range m.MappedFiles {
+			a.mappedMem[mf] = true
+		}
+		for _, s := range m.LargeAllocations {
+			a.largeAlloc[s] = true
+		}
+		if m.PeakRSSKB > a.peakRSS {
+			a.peakRSS = m.PeakRSSKB
+		}
+		if m.HeapGrowthKB > a.heapGrowth {
+			a.heapGrowth = m.HeapGrowthKB
+		}
+	}
+}
+
+// Result is the union of all runs' observations plus variance notes.
+type Result struct {
+	Syscalls   schema.SyscallsObservation
+	Network    schema.NetworkObservation
+	Filesystem schema.FilesystemObservation
+	Process    schema.ProcessObservation
+	Memory     schema.MemoryObservation
+	Notes      []string
 }
 
 // Build assembles the merged observations plus human-readable variance notes.
-func (a *Accumulator) Build() (schema.SyscallsObservation, schema.NetworkObservation, schema.FilesystemObservation, []string) {
+func (a *Accumulator) Build() Result {
 	sys := schema.SyscallsObservation{
 		Observed:                map[string]schema.SyscallRecord{},
 		SuspiciousNeverExpected: a.suspicious,
@@ -153,10 +211,40 @@ func (a *Accumulator) Build() (schema.SyscallsObservation, schema.NetworkObserva
 		ExecsTouched: filesSlice(a.filesExec),
 	}
 
-	return sys, net, fs, a.varianceNotes()
+	proc := schema.ProcessObservation{PrivilegeChanges: a.privChng}
+	for _, c := range a.children {
+		proc.ChildrenSpawned = append(proc.ChildrenSpawned, c)
+	}
+	sort.Slice(proc.ChildrenSpawned, func(i, j int) bool {
+		return proc.ChildrenSpawned[i].Path < proc.ChildrenSpawned[j].Path
+	})
+
+	mem := schema.MemoryObservation{PeakRSSKB: a.peakRSS, HeapGrowthKB: a.heapGrowth}
+	for _, r := range a.memRegions {
+		mem.ExecutableRegions = append(mem.ExecutableRegions, r)
+	}
+	sort.Slice(mem.ExecutableRegions, func(i, j int) bool {
+		return mem.ExecutableRegions[i].AddressRange < mem.ExecutableRegions[j].AddressRange
+	})
+	for mf := range a.mappedMem {
+		mem.MappedFiles = append(mem.MappedFiles, mf)
+	}
+	sort.Strings(mem.MappedFiles)
+	for s := range a.largeAlloc {
+		mem.LargeAllocations = append(mem.LargeAllocations, s)
+	}
+	sort.Slice(mem.LargeAllocations, func(i, j int) bool { return mem.LargeAllocations[i] < mem.LargeAllocations[j] })
+
+	return Result{
+		Syscalls:   sys,
+		Network:    net,
+		Filesystem: fs,
+		Process:    proc,
+		Memory:     mem,
+		Notes:      a.varianceNotes(),
+	}
 }
 
-// Confidence maps a run count to a baseline confidence level.
 // Confidence maps a run count to a baseline confidence level, and — matching
 // ConfidenceHigh's documented "3+ *consistent* runs" — caps at Medium when the
 // runs disagreed with each other (hasVariance). A baseline whose features come

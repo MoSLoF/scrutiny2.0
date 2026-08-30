@@ -17,16 +17,16 @@ func syscalls(names ...string) *schema.SyscallsObservation {
 
 func TestAddRun_UnionsSyscallsAndSumsCounts(t *testing.T) {
 	a := New()
-	a.AddRun(syscalls("read", "write"), nil, nil)
-	a.AddRun(syscalls("read", "openat"), nil, nil)
+	a.AddRun(syscalls("read", "write"), nil, nil, nil, nil)
+	a.AddRun(syscalls("read", "openat"), nil, nil, nil, nil)
 
-	sys, _, _, _ := a.Build()
+	r := a.Build()
 	for _, want := range []string{"read", "write", "openat"} {
-		if _, ok := sys.Observed[want]; !ok {
+		if _, ok := r.Syscalls.Observed[want]; !ok {
 			t.Errorf("merged baseline missing %q", want)
 		}
 	}
-	if got := sys.Observed["read"].Count; got != 2 {
+	if got := r.Syscalls.Observed["read"].Count; got != 2 {
 		t.Errorf("read count = %d, want 2 (summed across runs)", got)
 	}
 	if a.Runs() != 2 {
@@ -60,11 +60,11 @@ func TestConfidence(t *testing.T) {
 
 func TestVarianceNotes_FlagsUnstableSyscalls(t *testing.T) {
 	a := New()
-	a.AddRun(syscalls("read", "write"), nil, nil)
-	a.AddRun(syscalls("read", "write"), nil, nil)
-	a.AddRun(syscalls("read", "write", "ptrace"), nil, nil) // ptrace only in run 3
+	a.AddRun(syscalls("read", "write"), nil, nil, nil, nil)
+	a.AddRun(syscalls("read", "write"), nil, nil, nil, nil)
+	a.AddRun(syscalls("read", "write", "ptrace"), nil, nil, nil, nil) // ptrace only in run 3
 
-	_, _, _, notes := a.Build()
+	notes := a.Build().Notes
 	joined := strings.Join(notes, "\n")
 	if !strings.Contains(joined, "ptrace (1/3)") {
 		t.Errorf("expected variance note for ptrace (1/3), got:\n%s", joined)
@@ -76,9 +76,8 @@ func TestVarianceNotes_FlagsUnstableSyscalls(t *testing.T) {
 
 func TestVarianceNotes_NoneForSingleRun(t *testing.T) {
 	a := New()
-	a.AddRun(syscalls("read"), nil, nil)
-	_, _, _, notes := a.Build()
-	if len(notes) != 0 {
+	a.AddRun(syscalls("read"), nil, nil, nil, nil)
+	if notes := a.Build().Notes; len(notes) != 0 {
 		t.Errorf("single run should have no variance notes, got %v", notes)
 	}
 }
@@ -87,21 +86,21 @@ func TestAddRun_UnionsNetworkPorts(t *testing.T) {
 	a := New()
 	a.AddRun(nil, &schema.NetworkObservation{
 		ListeningPorts: []schema.ListeningPort{{Proto: "tcp", Address: "0.0.0.0", Port: 80}},
-	}, nil)
+	}, nil, nil, nil)
 	a.AddRun(nil, &schema.NetworkObservation{
 		ListeningPorts: []schema.ListeningPort{
 			{Proto: "tcp", Address: "0.0.0.0", Port: 80},
 			{Proto: "tcp", Address: "0.0.0.0", Port: 8080},
 		},
-	}, nil)
+	}, nil, nil, nil)
 
-	_, net, _, notes := a.Build()
-	if len(net.ListeningPorts) != 2 {
-		t.Fatalf("listening ports = %d, want 2 (union)", len(net.ListeningPorts))
+	r := a.Build()
+	if len(r.Network.ListeningPorts) != 2 {
+		t.Fatalf("listening ports = %d, want 2 (union)", len(r.Network.ListeningPorts))
 	}
 	// Port 8080 appeared in only 1 of 2 runs — should be flagged unstable.
-	if !strings.Contains(strings.Join(notes, "\n"), "tcp/8080 (1/2)") {
-		t.Errorf("expected variance note for tcp/8080, got %v", notes)
+	if !strings.Contains(strings.Join(r.Notes, "\n"), "tcp/8080 (1/2)") {
+		t.Errorf("expected variance note for tcp/8080, got %v", r.Notes)
 	}
 }
 
@@ -112,15 +111,15 @@ func TestAddRun_MergesFilesystemCounts(t *testing.T) {
 		}
 	}
 	a := New()
-	a.AddRun(nil, nil, fs("/tmp/x", 2))
-	a.AddRun(nil, nil, fs("/tmp/x", 3))
+	a.AddRun(nil, nil, fs("/tmp/x", 2), nil, nil)
+	a.AddRun(nil, nil, fs("/tmp/x", 3), nil, nil)
 
-	_, _, out, _ := a.Build()
-	if len(out.PathsWritten) != 1 {
-		t.Fatalf("written paths = %d, want 1 (deduped)", len(out.PathsWritten))
+	r := a.Build()
+	if len(r.Filesystem.PathsWritten) != 1 {
+		t.Fatalf("written paths = %d, want 1 (deduped)", len(r.Filesystem.PathsWritten))
 	}
-	if out.PathsWritten[0].Count != 5 {
-		t.Errorf("write count = %d, want 5 (summed)", out.PathsWritten[0].Count)
+	if r.Filesystem.PathsWritten[0].Count != 5 {
+		t.Errorf("write count = %d, want 5 (summed)", r.Filesystem.PathsWritten[0].Count)
 	}
 }
 
@@ -133,19 +132,52 @@ func TestAddRun_UnionsRawSocketsAndPromiscuousInterfaces(t *testing.T) {
 	a.AddRun(nil, &schema.NetworkObservation{
 		RawSockets:            []schema.RawSocket{{Family: "packet", Protocol: "0x0003", Interface: "*"}},
 		PromiscuousInterfaces: []string{"eth0"},
-	}, nil)
+	}, nil, nil, nil)
 	a.AddRun(nil, &schema.NetworkObservation{
 		RawSockets: []schema.RawSocket{{Family: "packet", Protocol: "0x0003", Interface: "*"}},
-	}, nil) // second run: same raw socket, promiscuous interface NOT observed again
+	}, nil, nil, nil) // second run: same raw socket, promiscuous interface NOT observed again
 
-	_, net, _, notes := a.Build()
-	if len(net.RawSockets) != 1 {
-		t.Fatalf("raw sockets = %d, want 1 (deduped)", len(net.RawSockets))
+	r := a.Build()
+	if len(r.Network.RawSockets) != 1 {
+		t.Fatalf("raw sockets = %d, want 1 (deduped)", len(r.Network.RawSockets))
 	}
-	if len(net.PromiscuousInterfaces) != 1 || net.PromiscuousInterfaces[0] != "eth0" {
-		t.Errorf("promiscuous interfaces = %v, want [eth0]", net.PromiscuousInterfaces)
+	if len(r.Network.PromiscuousInterfaces) != 1 || r.Network.PromiscuousInterfaces[0] != "eth0" {
+		t.Errorf("promiscuous interfaces = %v, want [eth0]", r.Network.PromiscuousInterfaces)
 	}
-	// eth0 was promiscuous in only 1 of 2 runs — union keeps it, but it's
-	// worth confirming it doesn't silently disappear either way.
-	_ = notes
+}
+
+// TestAddRun_UnionsProcessAndMemory is the same class of regression guard for
+// the process and memory dimensions: without it, a --runs>1 baseline would
+// silently drop children, privilege changes, and executable memory regions.
+func TestAddRun_UnionsProcessAndMemory(t *testing.T) {
+	a := New()
+	a.AddRun(nil, nil, nil,
+		&schema.ProcessObservation{
+			ChildrenSpawned:  []schema.ChildProcess{{Name: "sh", Path: "/bin/sh", UID: 1000}},
+			PrivilegeChanges: []schema.PrivilegeChange{{FromUID: 1000, ToUID: 0, Syscall: "setuid"}},
+		},
+		&schema.MemoryObservation{
+			PeakRSSKB:         1000,
+			ExecutableRegions: []schema.MemoryRegion{{AddressRange: "aaaa-bbbb", BackedBy: "anonymous", Suspicious: true}},
+			MappedFiles:       []string{"/lib/libc.so.6"},
+		})
+	a.AddRun(nil, nil, nil,
+		&schema.ProcessObservation{
+			ChildrenSpawned: []schema.ChildProcess{{Name: "curl", Path: "/usr/bin/curl", UID: 1000}},
+		},
+		&schema.MemoryObservation{PeakRSSKB: 2048}) // higher peak
+
+	r := a.Build()
+	if len(r.Process.ChildrenSpawned) != 2 {
+		t.Errorf("children = %d, want 2 (union of both runs)", len(r.Process.ChildrenSpawned))
+	}
+	if len(r.Process.PrivilegeChanges) != 1 {
+		t.Errorf("privilege changes = %d, want 1", len(r.Process.PrivilegeChanges))
+	}
+	if len(r.Memory.ExecutableRegions) != 1 || !r.Memory.ExecutableRegions[0].Suspicious {
+		t.Errorf("exec regions = %+v, want 1 suspicious", r.Memory.ExecutableRegions)
+	}
+	if r.Memory.PeakRSSKB != 2048 {
+		t.Errorf("peak RSS = %d, want 2048 (max across runs)", r.Memory.PeakRSSKB)
+	}
 }

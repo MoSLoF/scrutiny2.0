@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/ebpf"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/network"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor/procfs"
 )
 
 const banner = `
@@ -212,8 +214,8 @@ func runBaseline(cfg Config) {
 			fmt.Printf("── run %d/%d ──\n", run, runs)
 		}
 		started := time.Now().UTC()
-		syscalls, files, netObs := captureAll(cfg, capReport.Backend, platformCtx)
-		acc.AddRun(syscalls, netObs, files)
+		c := captureAll(cfg, capReport.Backend, platformCtx)
+		acc.AddRun(c.syscalls, c.network, c.files, c.process, c.memory)
 		record.Scrutiny.Quality.Runs = append(record.Scrutiny.Quality.Runs, schema.RunRecord{
 			RunID:     run,
 			PID:       cfg.PID,
@@ -222,17 +224,19 @@ func runBaseline(cfg Config) {
 		})
 	}
 
-	sys, net, fs, notes := acc.Build()
-	record.Syscalls = sys
-	record.Network = net
-	record.Filesystem = fs
+	res := acc.Build()
+	record.Syscalls = res.Syscalls
+	record.Network = res.Network
+	record.Filesystem = res.Filesystem
+	record.Process = res.Process
+	record.Memory = res.Memory
 	record.Scrutiny.Quality.RunCount = acc.Runs()
-	record.Scrutiny.Quality.Confidence = baseline.Confidence(acc.Runs(), len(notes) > 0)
-	record.Scrutiny.Quality.VarianceNotes = notes
+	record.Scrutiny.Quality.Confidence = baseline.Confidence(acc.Runs(), len(res.Notes) > 0)
+	record.Scrutiny.Quality.VarianceNotes = res.Notes
 
 	fmt.Printf("Baseline complete: %d run(s), confidence %s, %d distinct syscalls\n",
-		acc.Runs(), record.Scrutiny.Quality.Confidence, len(sys.Observed))
-	for _, n := range notes {
+		acc.Runs(), record.Scrutiny.Quality.Confidence, len(res.Syscalls.Observed))
+	for _, n := range res.Notes {
 		fmt.Printf("  variance: %s\n", n)
 	}
 
@@ -277,15 +281,21 @@ func runObserve(cfg Config) {
 	obs := schema.NewObservation(baseline.Scrutiny.BaselineID, platformCtx, targetForPID(cfg.PID))
 	obs.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	syscalls, files, netObs := captureAll(cfg, capReport.Backend, platformCtx)
-	if syscalls != nil {
-		obs.Syscalls = *syscalls
+	c := captureAll(cfg, capReport.Backend, platformCtx)
+	if c.syscalls != nil {
+		obs.Syscalls = *c.syscalls
 	}
-	if files != nil {
-		obs.Filesystem = *files
+	if c.files != nil {
+		obs.Filesystem = *c.files
 	}
-	if netObs != nil {
-		obs.Network = *netObs
+	if c.network != nil {
+		obs.Network = *c.network
+	}
+	if c.process != nil {
+		obs.Process = *c.process
+	}
+	if c.memory != nil {
+		obs.Memory = *c.memory
 	}
 
 	obs.ContextMatch = baseline.Scrutiny.Platform.DetectedPlatform == platformCtx.DetectedPlatform
@@ -359,33 +369,76 @@ func targetForPID(pid int) schema.TargetProcess {
 	return target
 }
 
-// captureAll runs the kernel (syscall + filesystem) and network collectors
-// against the target over the same window, concurrently. Any of the returned
-// observations may be nil. Network polling runs in the background while the
-// syscall backend holds the foreground for the capture duration.
-func captureAll(cfg Config, backend schema.SensorBackend, platformCtx schema.PlatformContext) (*schema.SyscallsObservation, *schema.FilesystemObservation, *schema.NetworkObservation) {
+// capture bundles one window's observations across every sensor dimension.
+// Any field may be nil (e.g. no syscall backend, or a non-Linux stub).
+type capture struct {
+	syscalls *schema.SyscallsObservation
+	files    *schema.FilesystemObservation
+	network  *schema.NetworkObservation
+	process  *schema.ProcessObservation
+	memory   *schema.MemoryObservation
+}
+
+// captureAll runs the kernel (syscall + filesystem), network, process, and
+// memory collectors against the target over the same window, concurrently.
+// The syscall backend holds the foreground for the capture duration while the
+// procfs-based collectors poll in the background.
+func captureAll(cfg Config, backend schema.SensorBackend, platformCtx schema.PlatformContext) capture {
 	dur := time.Duration(cfg.Duration) * time.Second
 
 	var netObs *schema.NetworkObservation
-	done := make(chan struct{})
+	var procObs *schema.ProcessObservation
+	var memObs *schema.MemoryObservation
+
+	var wg sync.WaitGroup
+	wg.Add(3)
 	go func() {
-		defer close(done)
-		no, err := network.Collect(cfg.PID, dur)
-		if err != nil {
+		defer wg.Done()
+		if no, err := network.Collect(cfg.PID, dur); err == nil {
+			netObs = no
+		} else {
 			fmt.Printf("network collection failed: %v\n", err)
-			return
 		}
-		netObs = no
+	}()
+	go func() {
+		defer wg.Done()
+		if po, err := procfs.CollectProcess(cfg.PID, dur); err == nil {
+			procObs = po
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if mo, err := procfs.CollectMemory(cfg.PID, dur); err == nil {
+			memObs = mo
+		}
 	}()
 
 	syscalls, files := captureKernel(cfg, backend, platformCtx)
-	<-done
+	wg.Wait()
 
 	if netObs != nil {
-		fmt.Printf("Captured %d listening port(s), %d outbound connection(s)\n",
-			len(netObs.ListeningPorts), len(netObs.OutboundConnections))
+		fmt.Printf("Captured %d listening port(s), %d outbound connection(s), %d raw socket(s)\n",
+			len(netObs.ListeningPorts), len(netObs.OutboundConnections), len(netObs.RawSockets))
 	}
-	return syscalls, files, netObs
+	if procObs != nil || memObs != nil {
+		fmt.Printf("Captured %d child process(es), %d exec memory region(s)\n",
+			childCount(procObs), regionCount(memObs))
+	}
+	return capture{syscalls: syscalls, files: files, network: netObs, process: procObs, memory: memObs}
+}
+
+func childCount(p *schema.ProcessObservation) int {
+	if p == nil {
+		return 0
+	}
+	return len(p.ChildrenSpawned)
+}
+
+func regionCount(m *schema.MemoryObservation) int {
+	if m == nil {
+		return 0
+	}
+	return len(m.ExecutableRegions)
 }
 
 // captureKernel runs the active kernel backend against the target for the

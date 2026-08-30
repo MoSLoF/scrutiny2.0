@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/MoSLoF/scrutiny2.0/internal/analysis"
+	"github.com/MoSLoF/scrutiny2.0/internal/baseline"
 	"github.com/MoSLoF/scrutiny2.0/internal/context"
 	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor"
@@ -185,33 +186,73 @@ func runBaseline(cfg Config) {
 	if cfg.PID == 0 {
 		fatalf("baseline requires --pid <n>")
 	}
+	runs := cfg.Runs
+	if runs < 1 {
+		runs = 1
+	}
 
 	platformCtx, capReport := detectAndProbe()
-	fmt.Printf("Baselining PID %d — backend: %s, duration: %ds, runs: %d\n",
-		cfg.PID, capReport.Backend, cfg.Duration, cfg.Runs)
+	fmt.Printf("Baselining PID %d — backend: %s, %d run(s) × %ds\n",
+		cfg.PID, capReport.Backend, runs, cfg.Duration)
 
-	baseline := schema.NewBaseline(platformCtx, targetForPID(cfg.PID))
-	baseline.Scrutiny.Quality.DurationSeconds = cfg.Duration
+	record := schema.NewBaseline(platformCtx, targetForPID(cfg.PID))
+	record.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	syscalls, files, netObs := captureAll(cfg, capReport.Backend)
-	if syscalls != nil {
-		baseline.Syscalls = *syscalls
-		baseline.Scrutiny.Quality.RunCount = 1
-		baseline.Scrutiny.Quality.Confidence = schema.ConfidenceLow
+	// Capture the target over several windows and union what they see. A
+	// feature present in every run is stable; one that comes and goes is
+	// variance — captured in VarianceNotes so the analyst (and the confidence
+	// level) can weigh it.
+	acc := baseline.New()
+	for run := 1; run <= runs; run++ {
+		if run > 1 && !pidAlive(cfg.PID) {
+			fmt.Printf("⚠  PID %d exited — stopping after %d run(s)\n", cfg.PID, run-1)
+			break
+		}
+		if runs > 1 {
+			fmt.Printf("── run %d/%d ──\n", run, runs)
+		}
+		started := time.Now().UTC()
+		syscalls, files, netObs := captureAll(cfg, capReport.Backend)
+		acc.AddRun(syscalls, netObs, files)
+		record.Scrutiny.Quality.Runs = append(record.Scrutiny.Quality.Runs, schema.RunRecord{
+			RunID:     run,
+			PID:       cfg.PID,
+			StartedAt: started,
+			EndedAt:   time.Now().UTC(),
+		})
 	}
-	if files != nil {
-		baseline.Filesystem = *files
-	}
-	if netObs != nil {
-		baseline.Network = *netObs
+
+	sys, net, fs, notes := acc.Build()
+	record.Syscalls = sys
+	record.Network = net
+	record.Filesystem = fs
+	record.Scrutiny.Quality.RunCount = acc.Runs()
+	record.Scrutiny.Quality.Confidence = baseline.Confidence(acc.Runs())
+	record.Scrutiny.Quality.VarianceNotes = notes
+
+	fmt.Printf("Baseline complete: %d run(s), confidence %s, %d distinct syscalls\n",
+		acc.Runs(), record.Scrutiny.Quality.Confidence, len(sys.Observed))
+	for _, n := range notes {
+		fmt.Printf("  variance: %s\n", n)
 	}
 
 	if cfg.BaselineOut != "" {
-		writeJSONFile(cfg.BaselineOut, baseline)
+		writeJSONFile(cfg.BaselineOut, record)
 		fmt.Printf("Baseline written to %s\n", cfg.BaselineOut)
 	} else if cfg.JSONOutput {
-		printJSON(baseline)
+		printJSON(record)
 	}
+}
+
+// pidAlive reports whether the target process still exists. On Linux this reads
+// procfs; where procfs is absent (e.g. Windows) it can't cheaply tell, so it
+// assumes the process is alive.
+func pidAlive(pid int) bool {
+	if _, err := os.Stat("/proc"); err != nil {
+		return true
+	}
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
 }
 
 // ─── observe ─────────────────────────────────────────────────────────────────

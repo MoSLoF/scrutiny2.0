@@ -28,6 +28,9 @@ type Accumulator struct {
 	portRuns map[string]int
 	conns    map[string]schema.OutboundConnection
 	connRuns map[string]int
+	raw      map[string]schema.RawSocket
+	rawRuns  map[string]int
+	promisc  map[string]bool
 
 	filesRead    map[string]schema.FilePath
 	filesWritten map[string]schema.FilePath
@@ -45,6 +48,9 @@ func New() *Accumulator {
 		portRuns:     map[string]int{},
 		conns:        map[string]schema.OutboundConnection{},
 		connRuns:     map[string]int{},
+		raw:          map[string]schema.RawSocket{},
+		rawRuns:      map[string]int{},
+		promisc:      map[string]bool{},
 		filesRead:    map[string]schema.FilePath{},
 		filesWritten: map[string]schema.FilePath{},
 		filesCreated: map[string]schema.FilePath{},
@@ -90,6 +96,16 @@ func (a *Accumulator) AddRun(s *schema.SyscallsObservation, n *schema.NetworkObs
 			}
 			a.connRuns[k]++
 		}
+		for _, r := range n.RawSockets {
+			k := rawSockKey(r)
+			if _, ok := a.raw[k]; !ok {
+				a.raw[k] = r
+			}
+			a.rawRuns[k]++
+		}
+		for _, ifname := range n.PromiscuousInterfaces {
+			a.promisc[ifname] = true
+		}
 	}
 
 	if f != nil {
@@ -118,8 +134,16 @@ func (a *Accumulator) Build() (schema.SyscallsObservation, schema.NetworkObserva
 	for _, c := range a.conns {
 		net.OutboundConnections = append(net.OutboundConnections, c)
 	}
+	for _, r := range a.raw {
+		net.RawSockets = append(net.RawSockets, r)
+	}
+	for ifname := range a.promisc {
+		net.PromiscuousInterfaces = append(net.PromiscuousInterfaces, ifname)
+	}
 	sort.Slice(net.ListeningPorts, func(i, j int) bool { return portKey(net.ListeningPorts[i]) < portKey(net.ListeningPorts[j]) })
 	sort.Slice(net.OutboundConnections, func(i, j int) bool { return connKey(net.OutboundConnections[i]) < connKey(net.OutboundConnections[j]) })
+	sort.Slice(net.RawSockets, func(i, j int) bool { return rawSockKey(net.RawSockets[i]) < rawSockKey(net.RawSockets[j]) })
+	sort.Strings(net.PromiscuousInterfaces)
 
 	fs := schema.FilesystemObservation{
 		PathsRead:    filesSlice(a.filesRead),
@@ -173,6 +197,18 @@ func (a *Accumulator) varianceNotes() []string {
 	if len(unstablePorts) > 0 {
 		sort.Strings(unstablePorts)
 		notes = append(notes, "listening ports not seen in every run: "+strings.Join(unstablePorts, ", "))
+	}
+
+	var unstableRaw []string
+	for k, c := range a.rawRuns {
+		if c < a.runs {
+			r := a.raw[k]
+			unstableRaw = append(unstableRaw, fmt.Sprintf("%s/%s (%d/%d)", r.Family, r.Protocol, c, a.runs))
+		}
+	}
+	if len(unstableRaw) > 0 {
+		sort.Strings(unstableRaw)
+		notes = append(notes, "raw/packet sockets not seen in every run: "+strings.Join(unstableRaw, ", "))
 	}
 
 	return notes
@@ -246,4 +282,8 @@ func portKey(p schema.ListeningPort) string {
 
 func connKey(c schema.OutboundConnection) string {
 	return fmt.Sprintf("%s|%s|%d", c.Proto, c.DestinationIP, c.DestinationPort)
+}
+
+func rawSockKey(r schema.RawSocket) string {
+	return fmt.Sprintf("%s|%s|%s", r.Family, r.Protocol, r.Interface)
 }

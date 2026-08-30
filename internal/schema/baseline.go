@@ -188,12 +188,33 @@ type DNSQuery struct {
 	FirstSeenOffsetMS int64  `json:"first_seen_offset_ms"`
 }
 
+// RawSocket describes an AF_PACKET or SOCK_RAW socket held by the observed
+// process — the two socket classes a SLEEPWALKER-style listener uses, and
+// which never produce a row in /proc/net/{tcp,udp}. A "packet" family socket
+// bound to ALL interfaces (Interface == "*") is the specific shape of a
+// promiscuous-capture trigger listener.
+type RawSocket struct {
+	Family            string `json:"family"`              // "packet" (AF_PACKET) or "raw" (SOCK_RAW over IP)
+	Protocol          string `json:"protocol"`            // packet: EtherType hex (e.g. "0x0003" = ETH_P_ALL); raw: IP protocol name
+	Interface         string `json:"interface,omitempty"` // packet sockets only; "*" = bound to every interface (ifindex 0)
+	Inode             string `json:"inode"`
+	FirstSeenOffsetMS int64  `json:"first_seen_offset_ms"`
+}
+
 type NetworkObservation struct {
 	ListeningPorts      []ListeningPort      `json:"listening_ports"`
 	OutboundConnections []OutboundConnection `json:"outbound_connections"`
 	DNSQueries          []DNSQuery           `json:"dns_queries"`
-	WSLForwardedPorts   []int                `json:"wsl_forwarded_ports,omitempty"`
-	InteropNetworkCalls []string             `json:"interop_network_calls,omitempty"`
+	RawSockets          []RawSocket          `json:"raw_sockets,omitempty"`
+	// PromiscuousInterfaces lists interfaces with IFF_PROMISC set at capture
+	// time. This is SYSTEM-WIDE state, not attributable to the observed
+	// process on its own — another process or a legitimate capture tool could
+	// be the cause. It's meaningful as corroborating context, weighted most
+	// heavily alongside a RawSocket of family "packet" held by this same
+	// process. See analysis.diffNetwork for how the two are combined.
+	PromiscuousInterfaces []string `json:"promiscuous_interfaces,omitempty"`
+	WSLForwardedPorts     []int    `json:"wsl_forwarded_ports,omitempty"`
+	InteropNetworkCalls   []string `json:"interop_network_calls,omitempty"`
 }
 
 // ─── Filesystem Observations ─────────────────────────────────────────────────
@@ -289,54 +310,60 @@ type MemoryObservation struct {
 type AnomalyType string
 
 const (
-	AnomalyNewListeningPort      AnomalyType = "new_listening_port"
-	AnomalyNewOutboundConnection AnomalyType = "new_outbound_connection"
-	AnomalyExecutableWritten     AnomalyType = "executable_written"
-	AnomalyPrivilegeEscalation   AnomalyType = "privilege_escalation"
-	AnomalyNewChildProcess       AnomalyType = "new_child_process"
-	AnomalyRegistryPersistence   AnomalyType = "registry_persistence_path"
-	AnomalyProcFSReadOtherPID    AnomalyType = "proc_filesystem_read_other_pid"
-	AnomalyWineEscapeSyscall     AnomalyType = "wine_escape_syscall"
-	AnomalyWSLInteropFSWrite     AnomalyType = "wsl_interop_filesystem_write"
-	AnomalyUnexpectedSyscall     AnomalyType = "unexpected_syscall"
-	AnomalyExecMemoryAnonymous   AnomalyType = "executable_memory_anonymous"
-	AnomalyDNSQuerySuspicious    AnomalyType = "dns_query_suspicious"
-	AnomalyChildExecMismatch     AnomalyType = "child_process_hash_mismatch"
+	AnomalyNewListeningPort        AnomalyType = "new_listening_port"
+	AnomalyNewOutboundConnection   AnomalyType = "new_outbound_connection"
+	AnomalyExecutableWritten       AnomalyType = "executable_written"
+	AnomalyPrivilegeEscalation     AnomalyType = "privilege_escalation"
+	AnomalyNewChildProcess         AnomalyType = "new_child_process"
+	AnomalyRegistryPersistence     AnomalyType = "registry_persistence_path"
+	AnomalyProcFSReadOtherPID      AnomalyType = "proc_filesystem_read_other_pid"
+	AnomalyWineEscapeSyscall       AnomalyType = "wine_escape_syscall"
+	AnomalyWSLInteropFSWrite       AnomalyType = "wsl_interop_filesystem_write"
+	AnomalyUnexpectedSyscall       AnomalyType = "unexpected_syscall"
+	AnomalyExecMemoryAnonymous     AnomalyType = "executable_memory_anonymous"
+	AnomalyDNSQuerySuspicious      AnomalyType = "dns_query_suspicious"
+	AnomalyChildExecMismatch       AnomalyType = "child_process_hash_mismatch"
+	AnomalyRawSocketOpened         AnomalyType = "raw_socket_opened"
+	AnomalyPromiscuousModeObserved AnomalyType = "promiscuous_mode_observed"
 )
 
 // DefaultAnomalyWeights are the out-of-the-box risk weights (0-10).
 // Override in anomaly_config per-baseline as needed.
 var DefaultAnomalyWeights = map[AnomalyType]int{
-	AnomalyNewListeningPort:      9,
-	AnomalyNewOutboundConnection: 7,
-	AnomalyExecutableWritten:     10,
-	AnomalyPrivilegeEscalation:   10,
-	AnomalyNewChildProcess:       6,
-	AnomalyRegistryPersistence:   9,
-	AnomalyProcFSReadOtherPID:    8,
-	AnomalyWineEscapeSyscall:     10,
-	AnomalyWSLInteropFSWrite:     7,
-	AnomalyUnexpectedSyscall:     8,
-	AnomalyExecMemoryAnonymous:   9,
-	AnomalyDNSQuerySuspicious:    7,
-	AnomalyChildExecMismatch:     8,
+	AnomalyNewListeningPort:        9,
+	AnomalyNewOutboundConnection:   7,
+	AnomalyExecutableWritten:       10,
+	AnomalyPrivilegeEscalation:     10,
+	AnomalyNewChildProcess:         6,
+	AnomalyRegistryPersistence:     9,
+	AnomalyProcFSReadOtherPID:      8,
+	AnomalyWineEscapeSyscall:       10,
+	AnomalyWSLInteropFSWrite:       7,
+	AnomalyUnexpectedSyscall:       8,
+	AnomalyExecMemoryAnonymous:     9,
+	AnomalyDNSQuerySuspicious:      7,
+	AnomalyChildExecMismatch:       8,
+	AnomalyRawSocketOpened:         9,
+	AnomalyPromiscuousModeObserved: 8,
 }
 
 // DefaultMITREMappings maps anomaly types to ATT&CK technique IDs.
 var DefaultMITREMappings = map[AnomalyType]string{
-	AnomalyNewListeningPort:      "T1571",
-	AnomalyNewOutboundConnection: "T1041",
-	AnomalyExecutableWritten:     "T1027",
-	AnomalyPrivilegeEscalation:   "T1548",
-	AnomalyNewChildProcess:       "T1059",
-	AnomalyRegistryPersistence:   "T1547",
-	AnomalyProcFSReadOtherPID:    "T1057",
-	AnomalyWineEscapeSyscall:     "T1106",
-	AnomalyWSLInteropFSWrite:     "T1564.006",
-	AnomalyUnexpectedSyscall:     "T1106",
-	AnomalyExecMemoryAnonymous:   "T1055",
-	AnomalyDNSQuerySuspicious:    "T1071",
-	AnomalyChildExecMismatch:     "T1036",
+	AnomalyNewListeningPort:        "T1571",
+	AnomalyNewOutboundConnection:   "T1041",
+	AnomalyExecutableWritten:       "T1027",
+	AnomalyPrivilegeEscalation:     "T1548",
+	AnomalyNewChildProcess:         "T1059",
+	AnomalyRegistryPersistence:     "T1547",
+	AnomalyProcFSReadOtherPID:      "T1057",
+	AnomalyWineEscapeSyscall:       "T1106",
+	AnomalyWSLInteropFSWrite:       "T1564.006",
+	AnomalyUnexpectedSyscall:       "T1106",
+	AnomalyExecMemoryAnonymous:     "T1055",
+	AnomalyDNSQuerySuspicious:      "T1071",
+	AnomalyChildExecMismatch:       "T1036",
+	AnomalyRawSocketOpened:         "T1040",
+	AnomalyPromiscuousModeObserved: "T1040",
 }
 
 type NoiseSuppress struct {

@@ -114,6 +114,70 @@ func TestNewListeningPort_Network(t *testing.T) {
 	}
 }
 
+// TestSleepwalkerShape reproduces the exact network fingerprint from the
+// SLEEPWALKER writeup: a raw AF_PACKET socket bound to every interface
+// (ETH_P_ALL), and NOTHING in listening ports or outbound connections —
+// zero C2, zero bind, zero connect. Before the raw/packet-socket patch,
+// this observation would score 0 and verdict clean, because diffNetwork
+// only ever looked at ListeningPorts and OutboundConnections.
+func TestSleepwalkerShape_RawPacketSocketAloneIsFlagged(t *testing.T) {
+	b := baseWith("read")
+	o := obsWith(b, "read")
+	o.Network.RawSockets = []schema.RawSocket{
+		{Family: "packet", Protocol: "0x0003", Interface: "*"},
+	}
+	r := Analyze(b, o)
+
+	if r.Verdict == schema.VerdictClean {
+		t.Error("a bare raw-promiscuous listener with no ports/connections must not score clean")
+	}
+	var found bool
+	for _, a := range r.Anomalies {
+		if a.Type == schema.AnomalyRawSocketOpened {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a raw_socket_opened anomaly")
+	}
+}
+
+// TestPromiscuousMode_OnlyFlaggedAlongsidePacketSocket confirms the
+// deliberate false-positive guard: promiscuous mode is system-wide kernel
+// state (not attributable to one process), so it should NOT be flagged as
+// an anomaly on its own — only when the SAME observed process also holds a
+// packet-family socket, tying the two together.
+func TestPromiscuousMode_OnlyFlaggedAlongsidePacketSocket(t *testing.T) {
+	b := baseWith("read")
+
+	// Promiscuous interface present, but this process holds no packet
+	// socket — e.g. some unrelated tool (tcpdump) set it. Must NOT flag.
+	oNoPacket := obsWith(b, "read")
+	oNoPacket.Network.PromiscuousInterfaces = []string{"eth0"}
+	rNoPacket := Analyze(b, oNoPacket)
+	for _, a := range rNoPacket.Anomalies {
+		if a.Type == schema.AnomalyPromiscuousModeObserved {
+			t.Error("promiscuous mode should not be flagged without a packet socket on this process")
+		}
+	}
+
+	// Same promiscuous interface, but this process ALSO holds a packet
+	// socket — now it's a meaningful compound signal. Must flag.
+	oWithPacket := obsWith(b, "read")
+	oWithPacket.Network.PromiscuousInterfaces = []string{"eth0"}
+	oWithPacket.Network.RawSockets = []schema.RawSocket{{Family: "packet", Protocol: "0x0003", Interface: "*"}}
+	rWithPacket := Analyze(b, oWithPacket)
+	var found bool
+	for _, a := range rWithPacket.Anomalies {
+		if a.Type == schema.AnomalyPromiscuousModeObserved {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected promiscuous_mode_observed anomaly when process also holds a packet socket")
+	}
+}
+
 func TestPrivilegeEscalation_Process(t *testing.T) {
 	b := baseWith("read")
 	o := obsWith(b, "read")

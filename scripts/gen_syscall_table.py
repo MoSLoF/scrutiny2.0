@@ -13,6 +13,8 @@ print("//go:build linux")
 print()
 print("package ebpf")
 print()
+print('import "fmt"')
+print()
 print("// x86_64SyscallNames maps syscall numbers to their canonical names.")
 print("var x86_64SyscallNames = map[int64]string{")
 for name, num in pairs:

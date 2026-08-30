@@ -124,3 +124,103 @@ func parseProcNet(data, proto string, ownInodes map[string]bool) ([]schema.Liste
 	}
 	return listening, outbound
 }
+
+// parseRawSockets parses /proc/<pid>/net/{raw,raw6}. Same column layout as
+// the tcp/udp tables, but the field at the "port" position in local_address
+// is actually the IP protocol number the socket was opened with (confirmed
+// against a live kernel: socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) produces
+// local_address "00000000:0001", i.e. protocol 1 = ICMP) — there is no
+// separate protocol column. This is the table SLEEPWALKER's ICMP-echo
+// trigger channel would populate.
+func parseRawSockets(data string, ownInodes map[string]bool) []schema.RawSocket {
+	var out []schema.RawSocket
+	for i, line := range strings.Split(data, "\n") {
+		if i == 0 { // header row
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		inode := fields[9]
+		if ownInodes != nil && !ownInodes[inode] {
+			continue
+		}
+		_, protoNum, err := parseHexAddr(fields[1])
+		if err != nil {
+			continue
+		}
+		out = append(out, schema.RawSocket{
+			Family:   "raw",
+			Protocol: ipProtoName(protoNum),
+			Inode:    inode,
+		})
+	}
+	return out
+}
+
+func ipProtoName(n int) string {
+	switch n {
+	case 1:
+		return "icmp"
+	case 6:
+		return "tcp" // raw socket opened over the TCP protocol number — unusual, not necessarily malicious
+	case 17:
+		return "udp"
+	case 58:
+		return "icmpv6"
+	default:
+		return fmt.Sprintf("proto_%d", n)
+	}
+}
+
+// parsePacketSockets parses /proc/<pid>/net/packet — AF_PACKET sockets.
+// Column layout confirmed against a live kernel:
+//
+//	sk               RefCnt Type Proto  Iface R Rmem   User   Inode
+//	00000000852f07df 3      3    0003   0     1 0      0      759
+//
+// Proto 0x0003 is ETH_P_ALL — "capture everything on the wire," the exact
+// call a raw-promiscuous listener like SLEEPWALKER's trigger channel makes.
+// Iface 0 means bound to ifindex 0, i.e. every interface — resolvable
+// interface names get filled in for named ones; unresolvable/zero shows "*".
+func parsePacketSockets(data string, ownInodes map[string]bool) []schema.RawSocket {
+	var out []schema.RawSocket
+	for i, line := range strings.Split(data, "\n") {
+		if i == 0 { // header row
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 9 {
+			continue
+		}
+		inode := fields[8]
+		if ownInodes != nil && !ownInodes[inode] {
+			continue
+		}
+		proto := fields[3]
+		iface := "*"
+		if ifidx, err := strconv.Atoi(fields[4]); err == nil && ifidx != 0 {
+			if name, err := interfaceNameByIndex(ifidx); err == nil {
+				iface = name
+			} else {
+				iface = fields[4]
+			}
+		}
+		out = append(out, schema.RawSocket{
+			Family:    "packet",
+			Protocol:  "0x" + proto,
+			Interface: iface,
+			Inode:     inode,
+		})
+	}
+	return out
+}
+
+func interfaceNameByIndex(idx int) (string, error) {
+	iface, err := net.InterfaceByIndex(idx)
+	if err != nil {
+		return "", err
+	}
+	return iface.Name, nil
+}

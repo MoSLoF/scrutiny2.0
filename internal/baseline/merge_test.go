@@ -113,3 +113,29 @@ func TestAddRun_MergesFilesystemCounts(t *testing.T) {
 		t.Errorf("write count = %d, want 5 (summed)", out.PathsWritten[0].Count)
 	}
 }
+
+// TestAddRun_UnionsRawSocketsAndPromiscuousInterfaces is a regression test:
+// the Accumulator originally only handled ListeningPorts/OutboundConnections
+// from NetworkObservation, so RawSockets and PromiscuousInterfaces silently
+// vanished from any baseline captured with --runs > 1.
+func TestAddRun_UnionsRawSocketsAndPromiscuousInterfaces(t *testing.T) {
+	a := New()
+	a.AddRun(nil, &schema.NetworkObservation{
+		RawSockets:            []schema.RawSocket{{Family: "packet", Protocol: "0x0003", Interface: "*"}},
+		PromiscuousInterfaces: []string{"eth0"},
+	}, nil)
+	a.AddRun(nil, &schema.NetworkObservation{
+		RawSockets: []schema.RawSocket{{Family: "packet", Protocol: "0x0003", Interface: "*"}},
+	}, nil) // second run: same raw socket, promiscuous interface NOT observed again
+
+	_, net, _, notes := a.Build()
+	if len(net.RawSockets) != 1 {
+		t.Fatalf("raw sockets = %d, want 1 (deduped)", len(net.RawSockets))
+	}
+	if len(net.PromiscuousInterfaces) != 1 || net.PromiscuousInterfaces[0] != "eth0" {
+		t.Errorf("promiscuous interfaces = %v, want [eth0]", net.PromiscuousInterfaces)
+	}
+	// eth0 was promiscuous in only 1 of 2 runs — union keeps it, but it's
+	// worth confirming it doesn't silently disappear either way.
+	_ = notes
+}

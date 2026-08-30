@@ -96,3 +96,70 @@ func TestParseProcNet_UDPOnlyConnected(t *testing.T) {
 		t.Errorf("udp outbound = %+v, want ->8.8.8.8:53", outbound[0])
 	}
 }
+
+// sampleRaw is a real /proc/<pid>/net/raw snapshot, captured live from a
+// process holding socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) — the exact
+// channel a SLEEPWALKER-style ICMP trigger listener would use. The value
+// after the colon in local_address (0001) is the IP protocol number, NOT a
+// port — raw sockets have no port concept.
+const sampleRaw = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  95: 00000000:0001 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 747 2 0000000089ea71c0 0
+`
+
+func TestParseRawSockets_ICMPProtocolDecoded(t *testing.T) {
+	out := parseRawSockets(sampleRaw, map[string]bool{"747": true})
+	if len(out) != 1 {
+		t.Fatalf("raw sockets = %d, want 1", len(out))
+	}
+	if out[0].Family != "raw" || out[0].Protocol != "icmp" {
+		t.Errorf("raw socket = %+v, want family=raw protocol=icmp", out[0])
+	}
+}
+
+func TestParseRawSockets_FiltersByInode(t *testing.T) {
+	out := parseRawSockets(sampleRaw, map[string]bool{"999999": true})
+	if len(out) != 0 {
+		t.Errorf("got %d raw sockets, want 0 (inode not owned)", len(out))
+	}
+}
+
+// samplePacket is a real /proc/<pid>/net/packet snapshot, captured live from
+// a process holding socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)) bound to
+// ifindex 0 (every interface) — this is the exact shape SLEEPWALKER's
+// promiscuous trigger-capture socket takes, and the reason /proc/net/tcp and
+// /proc/net/udp alone can never see it.
+const samplePacket = `sk               RefCnt Type Proto  Iface R Rmem   User   Inode
+00000000852f07df 3      3    0003   0     1 0      0      759   
+`
+
+func TestParsePacketSockets_AllInterfacesShowsAsWildcard(t *testing.T) {
+	out := parsePacketSockets(samplePacket, map[string]bool{"759": true})
+	if len(out) != 1 {
+		t.Fatalf("packet sockets = %d, want 1", len(out))
+	}
+	if out[0].Family != "packet" || out[0].Protocol != "0x0003" || out[0].Interface != "*" {
+		t.Errorf("packet socket = %+v, want family=packet protocol=0x0003 interface=*", out[0])
+	}
+}
+
+func TestParsePacketSockets_ResolvesInterfaceIndex(t *testing.T) {
+	// ifindex 1 is loopback on every Linux box — swap the Iface column to 1
+	// and confirm the name gets resolved instead of staying numeric.
+	pkt := `sk               RefCnt Type Proto  Iface R Rmem   User   Inode
+00000000852f07df 3      3    0003   1     1 0      0      759   
+`
+	out := parsePacketSockets(pkt, map[string]bool{"759": true})
+	if len(out) != 1 {
+		t.Fatalf("packet sockets = %d, want 1", len(out))
+	}
+	if out[0].Interface != "lo" {
+		t.Errorf("interface = %q, want %q (ifindex 1 resolved by name)", out[0].Interface, "lo")
+	}
+}
+
+func TestParsePacketSockets_FiltersByInode(t *testing.T) {
+	out := parsePacketSockets(samplePacket, map[string]bool{"111": true})
+	if len(out) != 0 {
+		t.Errorf("got %d packet sockets, want 0 (inode not owned)", len(out))
+	}
+}

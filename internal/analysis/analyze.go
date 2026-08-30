@@ -13,6 +13,7 @@ package analysis
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -123,6 +124,46 @@ func diffNetwork(b *schema.Baseline, o *schema.Observation, cfg schema.AnomalyCo
 			fmt.Sprintf("new outbound connection to %s:%d (%s)", dst, c.DestinationPort, c.Proto),
 			nil, c, c.FirstSeenOffsetMS))
 	}
+
+	// Raw and packet-family sockets never show up in the listening-port or
+	// outbound-connection diffs above — a SLEEPWALKER-style listener (raw
+	// AF_PACKET, promiscuous, no bind, no connect) is invisible to both.
+	baseRaw := map[string]bool{}
+	for _, r := range b.Network.RawSockets {
+		baseRaw[rawKey(r)] = true
+	}
+	hasPacketSocket := false
+	for _, r := range o.Network.RawSockets {
+		if r.Family == "packet" {
+			hasPacketSocket = true
+		}
+		if baseRaw[rawKey(r)] {
+			continue
+		}
+		desc := fmt.Sprintf("new raw socket: family %s, protocol %s", r.Family, r.Protocol)
+		if r.Family == "packet" {
+			desc = fmt.Sprintf("new packet-capture socket: protocol %s on interface %s", r.Protocol, r.Interface)
+		}
+		out = append(out, newAnomaly(cfg, schema.DimNetwork, schema.AnomalyRawSocketOpened,
+			desc, nil, r, r.FirstSeenOffsetMS))
+	}
+
+	// PromiscuousInterfaces is system-wide state, not attributable to this
+	// process by itself — another process or a legitimate capture tool could
+	// be the cause. Only surface it as an anomaly when THIS process also
+	// holds a packet-family socket; otherwise it's most likely unrelated and
+	// would be pure noise on any box that runs tcpdump/Wireshark/another
+	// security agent.
+	if hasPacketSocket {
+		newPromisc := diffStrings(b.Network.PromiscuousInterfaces, o.Network.PromiscuousInterfaces)
+		if len(newPromisc) > 0 {
+			out = append(out, newAnomaly(cfg, schema.DimNetwork, schema.AnomalyPromiscuousModeObserved,
+				fmt.Sprintf("interface(s) newly in promiscuous mode while process holds a packet socket: %s",
+					strings.Join(newPromisc, ", ")),
+				b.Network.PromiscuousInterfaces, o.Network.PromiscuousInterfaces, 0))
+		}
+	}
+
 	return out
 }
 
@@ -388,6 +429,22 @@ func portKey(p schema.ListeningPort) string {
 
 func connKey(c schema.OutboundConnection) string {
 	return fmt.Sprintf("%s|%s|%d", c.Proto, c.DestinationIP, c.DestinationPort)
+}
+
+func rawKey(r schema.RawSocket) string {
+	return fmt.Sprintf("%s|%s|%s", r.Family, r.Protocol, r.Interface)
+}
+
+// diffStrings returns the entries of newList absent from oldList.
+func diffStrings(oldList, newList []string) []string {
+	old := stringSet(oldList)
+	var out []string
+	for _, s := range newList {
+		if !old[s] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func isExecutable(o *schema.Observation, f schema.FilePath) bool {

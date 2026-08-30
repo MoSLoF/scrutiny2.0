@@ -1,0 +1,8 @@
+# Normalize line endings: store text as LF in the repo, and check out LF on
+# every platform. This project builds on Linux/WSL2 (Go, clang, eBPF), so the
+# working tree must stay LF even on Windows checkouts — CRLF would break shell
+# scripts and churn diffs.
+* text=auto eol=lf
+
+# Explicitly binary — never touch line endings.
+*.o binary

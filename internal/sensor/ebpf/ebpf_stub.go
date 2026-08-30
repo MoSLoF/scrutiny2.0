@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/MoSLoF/scrutiny/internal/schema"
+	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 )
 
 // SyscallTracer stub — see tracer.go for the real Linux implementation.

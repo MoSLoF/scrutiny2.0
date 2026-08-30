@@ -19,10 +19,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/MoSLoF/scrutiny/internal/context"
-	"github.com/MoSLoF/scrutiny/internal/schema"
-	"github.com/MoSLoF/scrutiny/internal/sensor"
-	"github.com/MoSLoF/scrutiny/internal/sensor/ebpf"
+	"github.com/MoSLoF/scrutiny2.0/internal/context"
+	"github.com/MoSLoF/scrutiny2.0/internal/schema"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor/ebpf"
 )
 
 const banner = `

@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/MoSLoF/scrutiny/internal/schema"
+	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 )
 
 func detectWindows() (schema.PlatformContext, error) {

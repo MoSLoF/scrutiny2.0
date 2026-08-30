@@ -20,7 +20,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 
-	"github.com/MoSLoF/scrutiny/internal/schema"
+	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 )
 
 //go:embed bpf/syscall_trace.o

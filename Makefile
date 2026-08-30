@@ -2,7 +2,7 @@
 ## MoSLoF / HoneyBadger Vanguard
 
 BINARY       := scrutiny
-MODULE       := github.com/MoSLoF/scrutiny
+MODULE       := github.com/MoSLoF/scrutiny2.0
 CMD          := ./cmd/scrutiny
 VERSION      := $(shell git describe --tags --always --dirty 2>/dev/null || echo "v2.0.0-dev")
 LDFLAGS      := -ldflags "-s -w -X main.Version=$(VERSION)"

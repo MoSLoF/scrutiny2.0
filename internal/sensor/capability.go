@@ -19,8 +19,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/MoSLoF/scrutiny/internal/schema"
-	"github.com/MoSLoF/scrutiny/internal/sensor/ebpf"
+	"github.com/MoSLoF/scrutiny2.0/internal/schema"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor/ebpf"
 )
 
 // CapabilityReport is the full output of the capability probe.

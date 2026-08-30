@@ -237,13 +237,13 @@ func extractStraceVersion(s string) string {
 
 // ─── Capability Checks ───────────────────────────────────────────────────────
 
+// hasCap reports whether the current process holds capName in its EFFECTIVE
+// capability set, read from CapEff in /proc/self/status — the authoritative
+// source. An earlier version shelled out to `capsh --print` and substring-
+// matched the name, which false-positived for every capability: capsh also
+// prints the bounding and permitted sets (which list all caps), so e.g. a
+// non-root process reported CAP_BPF as held when it was not.
 func hasCap(capName string) bool {
-	// Use capsh if available for accurate capability check
-	out, err := exec.Command("capsh", "--print").Output()
-	if err == nil {
-		return strings.Contains(strings.ToLower(string(out)), capName)
-	}
-	// Fallback: check /proc/self/status CapEff
 	return checkCapFromProcStatus(capName)
 }
 
@@ -270,13 +270,20 @@ func checkCapFromProcStatus(capName string) bool {
 	return false
 }
 
+// capNameToBit maps a capability name to its bit position, or -1 if unknown.
+// Returning -1 (not 0) for unknown names matters: bit 0 is CAP_CHOWN, so a
+// zero fallback would make checkCapFromProcStatus test the wrong bit instead
+// of bailing out.
 func capNameToBit(name string) int {
 	caps := map[string]int{
 		"cap_bpf":        39,
 		"cap_sys_ptrace": 19,
 		"cap_sys_admin":  21,
 	}
-	return caps[strings.ToLower(name)]
+	if bit, ok := caps[strings.ToLower(name)]; ok {
+		return bit
+	}
+	return -1
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

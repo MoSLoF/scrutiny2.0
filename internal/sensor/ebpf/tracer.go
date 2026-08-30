@@ -31,13 +31,14 @@ var syscallTraceObj []byte
 // this is read via binary.Read against the raw ring buffer bytes.
 type syscallEvent struct {
 	TimestampNS uint64
+	LatencyNS   uint64
 	PID         uint32
 	TID         uint32
 	SyscallNr   int64
 	Args        [6]uint64
 	Ret         int64
 	IsExit      uint8
-	_           [7]byte // padding to match C struct alignment
+	_           [7]byte // matches struct syscall_event's explicit _pad[7]
 	Comm        [16]byte
 }
 
@@ -46,6 +47,7 @@ type syscallEvent struct {
 type SyscallTracer struct {
 	coll      *ebpf.Collection
 	enterLink link.Link
+	exitLink  link.Link
 	reader    *ringbuf.Reader
 	pidFilter *ebpf.Map
 	startTime time.Time
@@ -76,6 +78,11 @@ func NewSyscallTracer() (*SyscallTracer, error) {
 		coll.Close()
 		return nil, fmt.Errorf("trace_sys_enter program not found in object")
 	}
+	exitProg, ok := coll.Programs["trace_sys_exit"]
+	if !ok {
+		coll.Close()
+		return nil, fmt.Errorf("trace_sys_exit program not found in object")
+	}
 	pidFilter, ok := coll.Maps["pid_filter"]
 	if !ok {
 		coll.Close()
@@ -101,8 +108,19 @@ func NewSyscallTracer() (*SyscallTracer, error) {
 		return nil, fmt.Errorf("attaching sys_enter raw tracepoint: %w", err)
 	}
 
+	exitLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+		Name:    "sys_exit",
+		Program: exitProg,
+	})
+	if err != nil {
+		enterLink.Close()
+		coll.Close()
+		return nil, fmt.Errorf("attaching sys_exit raw tracepoint: %w", err)
+	}
+
 	reader, err := ringbuf.NewReader(eventsMap)
 	if err != nil {
+		exitLink.Close()
 		enterLink.Close()
 		coll.Close()
 		return nil, fmt.Errorf("opening ring buffer reader: %w", err)
@@ -111,6 +129,7 @@ func NewSyscallTracer() (*SyscallTracer, error) {
 	return &SyscallTracer{
 		coll:      coll,
 		enterLink: enterLink,
+		exitLink:  exitLink,
 		reader:    reader,
 		pidFilter: pidFilter,
 		events:    make(chan syscallEvent, 4096),
@@ -206,6 +225,7 @@ func (t *SyscallTracer) Events() <-chan syscallEvent {
 func (t *SyscallTracer) Stop() {
 	close(t.stopCh)
 	t.reader.Close()
+	t.exitLink.Close()
 	t.enterLink.Close()
 	t.coll.Close()
 }
@@ -235,7 +255,6 @@ func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, e
 	}
 
 	timeout := time.After(duration)
-	pendingEnter := make(map[int64]int64) // syscall_nr -> enter timestamp, for future latency stats
 
 	// firstEventNS anchors all offsets to the first observed event's
 	// kernel timestamp. evt.TimestampNS comes from bpf_ktime_get_ns
@@ -254,12 +273,14 @@ func Collect(pid uint32, duration time.Duration) (*schema.SyscallsObservation, e
 				finalizeSuspiciousFlags(obs)
 				return obs, nil
 			}
-			recordSyscallEvent(obs, evt, &firstEventNS, pendingEnter)
+			recordSyscallEvent(obs, evt, &firstEventNS)
 		}
 	}
 }
 
-func recordSyscallEvent(obs *schema.SyscallsObservation, evt syscallEvent, firstEventNS *int64, pending map[int64]int64) {
+const maxSamples = 3
+
+func recordSyscallEvent(obs *schema.SyscallsObservation, evt syscallEvent, firstEventNS *int64) {
 	name := syscallName(evt.SyscallNr)
 	if *firstEventNS == 0 {
 		*firstEventNS = int64(evt.TimestampNS)
@@ -270,12 +291,38 @@ func recordSyscallEvent(obs *schema.SyscallsObservation, evt syscallEvent, first
 	if !exists {
 		rec = schema.SyscallRecord{FirstSeenOffsetMS: offsetMS}
 	}
-	rec.Count++
 	rec.LastSeenOffsetMS = offsetMS
-	// Argument sampling is deferred: the raw-tracepoint probe leaves args
-	// zero (arg decode needs arch-specific pt_regs reads — see
-	// bpf/syscall_trace.c), so there is nothing meaningful to sample yet.
+
+	if evt.IsExit == 0 {
+		// Enter event: one per invocation, carrying the argument registers.
+		rec.Count++
+		if len(rec.ArgsSample) < maxSamples {
+			rec.ArgsSample = append(rec.ArgsSample, formatArgs(evt.Args))
+		}
+	} else {
+		// Exit event: return value + enter→exit latency.
+		rec.ExitCount++
+		if evt.Ret < 0 {
+			rec.ErrorCount++
+		}
+		if len(rec.RetSample) < maxSamples {
+			rec.RetSample = append(rec.RetSample, evt.Ret)
+		}
+		lat := int64(evt.LatencyNS)
+		rec.TotalLatencyNS += lat
+		if lat > rec.MaxLatencyNS {
+			rec.MaxLatencyNS = lat
+		}
+	}
+
 	obs.Observed[name] = rec
+}
+
+// formatArgs renders the six raw syscall-argument registers as hex. They are
+// register values — pointers, sizes, flags, fds — so hex is the useful form.
+func formatArgs(args [6]uint64) string {
+	return fmt.Sprintf("0x%x 0x%x 0x%x 0x%x 0x%x 0x%x",
+		args[0], args[1], args[2], args[3], args[4], args[5])
 }
 
 // finalizeSuspiciousFlags cross-references observed syscalls against the

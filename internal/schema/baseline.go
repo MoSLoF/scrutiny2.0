@@ -11,7 +11,9 @@ import (
 )
 
 const (
-	SchemaVersion = "2.0.0"
+	// SchemaVersion 2.1.0 added exit-side syscall data (ExitCount, ErrorCount,
+	// RetSample, latency) to SyscallRecord.
+	SchemaVersion = "2.1.0"
 	ToolVersion   = "2.0.0"
 )
 
@@ -135,6 +137,13 @@ type SyscallRecord struct {
 	FirstSeenOffsetMS int64    `json:"first_seen_offset_ms"`
 	LastSeenOffsetMS  int64    `json:"last_seen_offset_ms"`
 	ArgsSample        []string `json:"args_sample,omitempty"`
+
+	// Exit-side data, populated from the sys_exit probe (schema >= 2.1.0).
+	ExitCount      int     `json:"exit_count"`           // completed invocations observed
+	ErrorCount     int     `json:"error_count"`          // exits with a negative return value
+	RetSample      []int64 `json:"ret_sample,omitempty"` // sample of return values
+	MaxLatencyNS   int64   `json:"max_latency_ns"`       // slowest enter→exit seen
+	TotalLatencyNS int64   `json:"total_latency_ns"`     // sum over ExitCount (mean = total/exit)
 }
 
 type SyscallPercentiles struct {

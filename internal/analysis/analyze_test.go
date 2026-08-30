@@ -178,6 +178,25 @@ func TestPromiscuousMode_OnlyFlaggedAlongsidePacketSocket(t *testing.T) {
 	}
 }
 
+func TestNewChildProcess_DedupedByPath(t *testing.T) {
+	b := baseWith("read")
+	o := obsWith(b, "read")
+	// Same helper spawned three times (distinct instances, same path).
+	sleepChild := schema.ChildProcess{Name: "sleep", Path: "/usr/bin/sleep", UID: 1000}
+	o.Process.ChildrenSpawned = []schema.ChildProcess{sleepChild, sleepChild, sleepChild}
+	r := Analyze(b, o)
+
+	var newChild int
+	for _, a := range r.Anomalies {
+		if a.Type == schema.AnomalyNewChildProcess {
+			newChild++
+		}
+	}
+	if newChild != 1 {
+		t.Errorf("new_child_process anomalies = %d, want 1 (deduped by path)", newChild)
+	}
+}
+
 func TestPrivilegeEscalation_Process(t *testing.T) {
 	b := baseWith("read")
 	o := obsWith(b, "read")

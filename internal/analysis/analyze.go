@@ -219,13 +219,22 @@ func diffProcess(b *schema.Baseline, o *schema.Observation, cfg schema.AnomalyCo
 	for _, c := range b.Process.ChildrenSpawned {
 		baseChildren[c.Path] = c.SHA256
 	}
+	// A process that spawns the same helper repeatedly (e.g. sleep in a loop)
+	// is one finding per distinct binary, not one per invocation — flag each
+	// child path once.
+	flagged := map[string]bool{}
 	for _, c := range o.Process.ChildrenSpawned {
+		if flagged[c.Path] {
+			continue
+		}
 		baseHash, known := baseChildren[c.Path]
 		switch {
 		case !known:
+			flagged[c.Path] = true
 			out = append(out, newAnomaly(cfg, schema.DimProcess, schema.AnomalyNewChildProcess,
 				fmt.Sprintf("new child process %s (%s)", c.Name, c.Path), nil, c, c.FirstSeenOffsetMS))
 		case baseHash != "" && c.SHA256 != "" && baseHash != c.SHA256:
+			flagged[c.Path] = true
 			out = append(out, newAnomaly(cfg, schema.DimProcess, schema.AnomalyChildExecMismatch,
 				fmt.Sprintf("child %s hash differs from baseline", c.Path), baseHash, c.SHA256, c.FirstSeenOffsetMS))
 		}

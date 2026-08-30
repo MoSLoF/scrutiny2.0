@@ -24,6 +24,7 @@ import (
 	"github.com/MoSLoF/scrutiny2.0/internal/schema"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor"
 	"github.com/MoSLoF/scrutiny2.0/internal/sensor/ebpf"
+	"github.com/MoSLoF/scrutiny2.0/internal/sensor/network"
 )
 
 const banner = `
@@ -192,10 +193,14 @@ func runBaseline(cfg Config) {
 	baseline := schema.NewBaseline(platformCtx, targetForPID(cfg.PID))
 	baseline.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	if syscalls := captureSyscalls(cfg, capReport.Backend); syscalls != nil {
+	syscalls, netObs := captureAll(cfg, capReport.Backend)
+	if syscalls != nil {
 		baseline.Syscalls = *syscalls
 		baseline.Scrutiny.Quality.RunCount = 1
 		baseline.Scrutiny.Quality.Confidence = schema.ConfidenceLow
+	}
+	if netObs != nil {
+		baseline.Network = *netObs
 	}
 
 	if cfg.BaselineOut != "" {
@@ -228,8 +233,12 @@ func runObserve(cfg Config) {
 	obs := schema.NewObservation(baseline.Scrutiny.BaselineID, platformCtx, targetForPID(cfg.PID))
 	obs.Scrutiny.Quality.DurationSeconds = cfg.Duration
 
-	if syscalls := captureSyscalls(cfg, capReport.Backend); syscalls != nil {
+	syscalls, netObs := captureAll(cfg, capReport.Backend)
+	if syscalls != nil {
 		obs.Syscalls = *syscalls
+	}
+	if netObs != nil {
+		obs.Network = *netObs
 	}
 
 	obs.ContextMatch = baseline.Scrutiny.Platform.DetectedPlatform == platformCtx.DetectedPlatform
@@ -301,6 +310,35 @@ func targetForPID(pid int) schema.TargetProcess {
 		target.Path = exe
 	}
 	return target
+}
+
+// captureAll runs the syscall and network collectors against the target over
+// the same window, concurrently, and returns both observations (either may be
+// nil). Network polling runs in the background while the syscall backend holds
+// the foreground for the capture duration.
+func captureAll(cfg Config, backend schema.SensorBackend) (*schema.SyscallsObservation, *schema.NetworkObservation) {
+	dur := time.Duration(cfg.Duration) * time.Second
+
+	var netObs *schema.NetworkObservation
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		no, err := network.Collect(cfg.PID, dur)
+		if err != nil {
+			fmt.Printf("network collection failed: %v\n", err)
+			return
+		}
+		netObs = no
+	}()
+
+	syscalls := captureSyscalls(cfg, backend)
+	<-done
+
+	if netObs != nil {
+		fmt.Printf("Captured %d listening port(s), %d outbound connection(s)\n",
+			len(netObs.ListeningPorts), len(netObs.OutboundConnections))
+	}
+	return syscalls, netObs
 }
 
 // captureSyscalls runs the active backend against the target for the configured
